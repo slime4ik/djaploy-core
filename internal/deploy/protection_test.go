@@ -9,8 +9,7 @@ func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
 // Path protection has to behave the SAME no matter how the user typed the path: with or without a
 // leading slash, with or without a trailing one. This walks the full path: parsePathsStr normalizes
-// the leading slash, gwPathGuard normalizes the trailing one and emits three forms (/admin,
-// /admin/, /admin/*).
+// the leading slash, gwPathGuard normalizes the trailing one and emits three forms (/admin, /admin/, /admin/*).
 func TestPathProtectionSlashVariants(t *testing.T) {
 	inputs := []string{"/admin", "/admin/", "admin", "admin/", "  admin  ", "/admin//"}
 	const wantMatchers = "/admin /admin/ /admin/*" // covers /admin, /admin/ and subpaths like /admin/login
@@ -45,8 +44,7 @@ func TestPathProtectionMultiplePathsAndIPs(t *testing.T) {
 	}
 }
 
-// With no VPN and no trusted IPs there is NO guard, otherwise everyone would be locked out,
-// including the user.
+// With no VPN and no trusted IPs the guard is NOT added (it would lock everyone out, the user included).
 func TestPathProtectionNoTrustedNoGuard(t *testing.T) {
 	d := &Deployment{ServerState: ServerState{VPNPaths: parsePathsStr("/admin"), VPN: false}}
 	if got := gwPathGuard(d); got != "" {

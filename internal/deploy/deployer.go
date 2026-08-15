@@ -20,10 +20,10 @@ type Deployer struct {
 	dep         *Deployment
 	repo        *Repo
 	encKey      []byte
-	token       string // GitHub installation token, used by git clone/fetch
+	token       string // GitHub installation token (для git clone/fetch)
 	dir         string // /opt/djaploy/<name>
-	needSudo    bool   // logged in as non-root, so system steps go through sudo
-	rollbackSHA string // non-empty means rollback: deploy this commit instead of HEAD
+	needSudo    bool   // вход не под root → системные шаги гоним через sudo
+	rollbackSHA string // непусто = откат: разворачиваем этот коммит вместо HEAD
 }
 
 // priv wraps a script so it runs with root rights. As root the script is left as is,
@@ -34,11 +34,14 @@ func (d *Deployer) priv(script string) string {
 		return script
 	}
 	b64 := base64.StdEncoding.EncodeToString([]byte(script))
-	return "printf '%s\\n' " + sq(d.j.sshPassword) + " | sudo -S -p '' bash -c \"$(printf %s " + sq(b64) + " | base64 -d)\""
+	run := "bash -c \"$(printf %s " + sq(b64) + " | base64 -d)\""
+	if d.j.sshPassword == "" {
+		return "sudo -n " + run
+	}
+	return "printf '%s\\n' " + sq(d.j.sshPassword) + " | sudo -S -p '' " + run
 }
 
-// writeFile writes a file. As root it writes directly, otherwise into a temp file that is
-// moved into place with sudo.
+// writeFile writes a file (as root directly, otherwise to a temp path and sudo-mv into place).
 func (d *Deployer) writeFile(path, content, mode string) error {
 	if !d.needSudo {
 		return d.ssh.WriteFile(path, content, mode)
@@ -88,15 +91,13 @@ func gitAuth(provider, token string) string {
 	return "-c http.extraheader=" + sq("AUTHORIZATION: basic "+basic) + " "
 }
 
-// runDeployment is the whole cycle: DNS, then SSH, then the steps. Logs stream into dep and
-// errors are structured.
+// runDeployment is the whole cycle: DNS → SSH → steps. Logs stream into dep, errors are structured.
 func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 	dep := j.dep
 	dep.setStatus(StatusRunning)
 	persist(repo, dep, false)
 
-	// 1. DNS before SSH, so we can point at the A record right away. A worker or bot has no
-	// domain, so it is skipped.
+	// 1. DNS before SSH, so we can talk about the A record right away. A worker/bot has no domain: skip.
 	if !dep.IsWorker() {
 		dep.setStep("dns", "running")
 		dep.log("dns", KindStep, "Проверяю DNS: "+dep.Domain+" → "+dep.ServerIP)
@@ -111,16 +112,34 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 
 	// 2. SSH connection (root plus password).
 	dep.setStep("connect", "running")
-	dep.log("connect", KindStep, "Подключаюсь по SSH: "+j.sshUser+"@"+dep.ServerIP)
-	sshc, hkErr, err := dialPasswordPinned(ctx, repo, dep.UserID, dep.ServerIP, j.sshUser, j.sshPassword)
+	byKey := j.accessPEM != ""
+	how := "по паролю"
+	if byKey {
+		how = "по ключу, который ты выдал"
+	}
+	dep.log("connect", KindStep, "Подключаюсь по SSH: "+j.sshUser+"@"+dep.ServerIP+" ("+how+")")
+	var (
+		sshc  *SSH
+		hkErr *DeployError
+		err   error
+	)
+	if byKey {
+		sshc, hkErr, err = dialKeyPinned(ctx, repo, dep.UserID, dep.ServerIP, j.sshUser, j.accessPEM)
+	} else {
+		sshc, hkErr, err = dialPasswordPinned(ctx, repo, dep.UserID, dep.ServerIP, j.sshUser, j.sshPassword)
+	}
 	if hkErr != nil {
 		failStep(repo, dep, "connect", hkErr)
 		return
 	}
 	if err != nil {
+		hint := "Проверь: IP верный, пароль от «" + j.sshUser + "» верный, порт 22 открыт, и на сервере разрешён вход по паролю (sshd_config: PasswordAuthentication yes)."
+		if byKey {
+			hint = "Похоже, нашу строку убрали из " + accessAuthPath + " у пользователя «" + j.sshUser + "» (или её там и не было). " +
+				"Открой карточку сервера, скопируй команду выдачи доступа и выполни её заново. Ещё проверь, что порт 22 открыт."
+		}
 		failStep(repo, dep, "connect", derr("ssh_failed",
-			"Не удалось подключиться по SSH к "+dep.ServerIP+".",
-			"Проверь: IP верный, пароль от «"+j.sshUser+"» верный, порт 22 открыт, и на сервере разрешён вход по паролю (sshd_config: PasswordAuthentication yes)."))
+			"Не удалось подключиться по SSH к "+dep.ServerIP+".", hint))
 		return
 	}
 	defer sshc.Close()
@@ -133,25 +152,34 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 	// not logged in as root? many VPS providers hand out a sudo user instead, so we escalate.
 	if sshCapture(sshc, "id -u") != "0" {
 		d.needSudo = true
-		if sshCapture(sshc, "printf '%s\\n' "+sq(j.sshPassword)+" | sudo -S -p '' id -u 2>&1") != "0" {
+		probe := "sudo -n id -u 2>&1" // по ключу пароля нет: нужен NOPASSWD
+		hint := "Дай этому пользователю sudo без пароля (в visudo: " + j.sshUser + " ALL=(ALL) NOPASSWD:ALL), либо выдай доступ для root."
+		if !byKey {
+			probe = "printf '%s\\n' " + sq(j.sshPassword) + " | sudo -S -p '' id -u 2>&1"
+			hint = "Дай этому пользователю sudo (визард: usermod -aG sudo " + j.sshUser + "), либо укажи root и его пароль."
+		}
+		if sshCapture(sshc, probe) != "0" {
 			failStep(repo, dep, "connect", derr("no_sudo",
-				"Вход выполнен не под root, и sudo не сработал для «"+j.sshUser+"».",
-				"Дай этому пользователю sudo (визард: usermod -aG sudo "+j.sshUser+"), либо укажи root и его пароль."))
+				"Вход выполнен не под root, и sudo не сработал для «"+j.sshUser+"».", hint))
 			return
 		}
 		dep.log("connect", KindOut, "Вход не под root — системные шаги пойдут через sudo")
 	}
 
-	// install our SSH key for future password-less redeploys and CD (quiet, never fails a deploy)
-	d.installAccessKey()
+	// access for future redeploys and CD: we already came in on the user's key, we do not add a second one
+	if byKey {
+		d.keepAccessKey()
+	} else {
+		d.installAccessKey()
+	}
 
 	type stepDef struct {
 		key     string
 		timeout time.Duration
-		soft    bool // a soft step never fails the deploy, the project already runs
+		soft    bool // soft-шаг не валит деплой — проект уже работает
 		fn      func(context.Context) *DeployError
 	}
-	isDjango := frameworkOrDefault(dep.ServerState.Framework) == frameworkDjango
+	isDjango := dep.RunsDjangoTasks()
 	var steps []stepDef
 	if dep.IsWorker() {
 		// worker or bot: no Caddy and no HTTP check, we just build and start compose
@@ -171,7 +199,7 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 			{"docker", 8 * time.Minute, false, d.ensureDocker},
 			{"clone", 4 * time.Minute, false, d.clone},
 			{"env", 1 * time.Minute, false, d.writeEnv},
-			{"caddy", 5 * time.Minute, false, d.setupGateway}, // shared Caddy gateway (multi-site)
+			{"caddy", 5 * time.Minute, false, d.setupGateway}, // общий Caddy-шлюз (мульти-сайт)
 			{"up", 18 * time.Minute, false, d.composeUp},
 		}
 		// Django: migrate and collectstatic run BEFORE health, so the site is checked migrated.
@@ -183,8 +211,7 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 	if j.createSU {
 		steps = append(steps, stepDef{"superuser", 2 * time.Minute, true, d.createSuperuser})
 	}
-	// VPN goes before non-root: it writes the client config into the project, and the handover
-	// then passes that config on to the deploy user.
+	// VPN before non-root: it writes the client config into the project, and handover passes it to the deploy user.
 	if j.enableVPN {
 		steps = append(steps, stepDef{"vpn", 10 * time.Minute, true, d.provisionVPN})
 	}
@@ -222,6 +249,7 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 					"Шаг «"+stepTitle(dep, st.key)+"» не уложился в отведённое время и был прерван.",
 					"Чаще всего это зависший apt/сборка. Проверь сервер и попробуй ещё раз.")
 			}
+			d.cleanupFailedSite()
 			failStep(repo, dep, st.key, de)
 			return
 		}
@@ -241,7 +269,7 @@ func runDeployment(ctx context.Context, repo *Repo, encKey []byte, j *job) {
 		cancel()
 	}
 
-	d.recordRelease() // remember the deployed commit so we can roll back to this version
+	d.recordRelease() // запомнить задеплоенный коммит — для отката на эту версию
 	if dep.IsWorker() {
 		dep.log("", KindOK, "Готово ✓  Контейнеры собраны и запущены на сервере")
 	} else {
@@ -265,8 +293,7 @@ func failStep(repo *Repo, dep *Deployment, step string, de *DeployError) {
 	dep.finish()
 }
 
-// persist writes state to the database; final=true stores the logs as well. A failed write
-// here never fails the deploy.
+// persist writes state to the database; final=true also writes the logs. Persist errors never fail a deploy.
 func persist(repo *Repo, dep *Deployment, final bool) {
 	if repo == nil {
 		return
@@ -305,10 +332,10 @@ func (d *Deployer) prepareServer(ctx context.Context) *DeployError {
 	d.dep.log("prepare", KindStep, "Обновляю пакеты и ставлю fail2ban…")
 	script := `set -e
 export DEBIAN_FRONTEND=noninteractive
-# DPkg::Lock::Timeout=300 makes apt WAIT for the lock up to 5 minutes (on a fresh server the
-# background apt-daily/unattended-upgrades holds it) instead of failing with "Could not get lock".
-# We also do not fail when a THIRD-PARTY repository is broken (a stale PPA, say): the packages we
-# need live in the main Ubuntu repository, which is reachable. We report it and move on.
+# DPkg::Lock::Timeout=300 — apt сам ЖДЁТ замок до 5 мин (на свежем сервере фоновый apt-daily/
+# unattended-upgrades держит его), а не падает с "Could not get lock".
+# не валимся, если споткнулся СТОРОННИЙ репозиторий (напр. битый PPA) — нужные пакеты
+# лежат в основном репозитории Ubuntu, он доступен. Сообщаем и идём дальше.
 apt-get -o DPkg::Lock::Timeout=300 update -y || echo "(apt-get update частично не прошёл — вероятно сторонний репозиторий; продолжаю)"
 apt-get -o DPkg::Lock::Timeout=300 install -y -o Dpkg::Options::=--force-confnew fail2ban curl ca-certificates git
 cat > /etc/fail2ban/jail.local <<'INI'
@@ -319,7 +346,7 @@ bantime = 1h
 INI
 systemctl enable --now fail2ban
 systemctl restart fail2ban
-# open HTTP/HTTPS on the local firewall (Caddy and Let's Encrypt need it). Cloud firewalls are separate.
+# открыть HTTP/HTTPS на локальном фаерволе (нужно Caddy и Let's Encrypt). Cloud-фаервол — отдельно.
 if command -v ufw >/dev/null 2>&1; then ufw allow 80/tcp >/dev/null 2>&1 || true; ufw allow 443/tcp >/dev/null 2>&1 || true; fi
 echo "Сервер подготовлен, fail2ban активен."`
 	if err := d.run(ctx, "prepare", script); err != nil {
@@ -335,9 +362,9 @@ echo "Сервер подготовлен, fail2ban активен."`
 func (d *Deployer) ensureDocker(ctx context.Context) *DeployError {
 	d.dep.log("docker", KindStep, "Проверяю Docker и зеркала реестра…")
 	script := `set -e
-# On fresh servers apt auto-updates run in the background (unattended-upgrades / apt-daily) and
-# hold the lock, so installing Docker (apt again) fails with "Could not get lock". We wait for the
-# background apt to release it (up to ~5 min). No fuser on the box means we just carry on.
+# На свежих серверах в фоне крутится автообновление apt (unattended-upgrades / apt-daily) и
+# держит замок — установка Docker (внутри тоже apt) падает с "Could not get lock". Ждём, пока
+# фоновый apt отпустит замок (до ~5 мин). fuser нет → проходим дальше (set +e на условии while).
 i=0
 while command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
   i=$((i+1)); [ "$i" -gt 60 ] && { echo "apt-замок всё ещё занят — продолжаю, может не пройти"; break; }
@@ -348,10 +375,27 @@ if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
 mkdir -p /etc/docker
-cat > /etc/docker/daemon.json <<'JSON'
-{ "registry-mirrors": ["https://mirror.gcr.io", "https://dockerhub.timeweb.cloud"], "userland-proxy": false, "dns": ["8.8.8.8", "1.1.1.1"] }
+cat > /tmp/.djaploy-daemon.json <<'JSON'
+{ "registry-mirrors": ["https://mirror.gcr.io", "https://dockerhub.timeweb.cloud"], "userland-proxy": false, "dns": ["8.8.8.8", "1.1.1.1"], "live-restore": true }
 JSON
-systemctl restart docker || true
+# Рестарт демона гасит ВСЕ контейнеры на сервере: соседний сайт, который мы даже не деплоим,
+# ляжет (и не встанет, если в его compose нет restart-политики). Поэтому:
+#   конфиг уже наш  → не трогаем демон вообще (обычный случай второго и последующих деплоев);
+#   конфиг изменился и контейнеры работают → reload (зеркала реестра подхватываются без простоя);
+#   контейнеров нет → можно спокойно рестартовать.
+# live-restore в конфиге нужен, чтобы будущие рестарты демона не роняли контейнеры.
+if cmp -s /tmp/.djaploy-daemon.json /etc/docker/daemon.json; then
+  echo "Настройки Docker уже наши — демон не трогаю."
+else
+  cp /tmp/.djaploy-daemon.json /etc/docker/daemon.json
+  if [ -n "$(docker ps -q 2>/dev/null)" ]; then
+    echo "На сервере работают контейнеры — применяю настройки без рестарта демона (reload)."
+    systemctl reload docker 2>/dev/null || kill -HUP "$(cat /var/run/docker.pid 2>/dev/null)" 2>/dev/null || true
+  else
+    systemctl restart docker || true
+  fi
+fi
+rm -f /tmp/.djaploy-daemon.json
 docker compose version >/dev/null 2>&1 || { echo "плагин docker compose недоступен"; exit 42; }
 echo "Docker готов."`
 	if err := d.run(ctx, "docker", script); err != nil {
@@ -423,8 +467,17 @@ func (d *Deployer) composeUp(ctx context.Context) *DeployError {
 		return derr("build_failed", "Сборка или запуск контейнеров упали.", hint)
 	}
 	d.dep.markState(func(s *ServerState) { s.LastBuiltAt = time.Now().UTC().Format(time.RFC3339) })
-	// Web project: the app is up, so we attach it to the shared gateway network by alias for Caddy
-	// to reach it. Doing it here covers deploy, redeploy and rollback at once (all call composeUp).
+	// Restart policy for the project containers. Set through docker update rather than in the overlay:
+	// the overlay would need the service name, and a typo there would create a phantom service with no
+	// image. Without a policy the container does not come back after a server reboot or a docker daemon
+	// restart, and the site quietly stays down until the user shows up and fixes it by hand.
+	rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+	restart := fmt.Sprintf(`cd %q && ids=$(docker compose %s ps -q 2>/dev/null); [ -n "$ids" ] && docker update --restart unless-stopped $ids >/dev/null 2>&1; true`,
+		d.dir, composeFiles)
+	_ = d.ssh.Run(rctx, d.priv(restart), func(string) {})
+	rcancel()
+	// web project: the app is up, so attach it to the shared gateway network (by alias) for Caddy to reach.
+	// Doing it here covers deploy, redeploy and rollback at once (they all call composeUp).
 	if !d.dep.IsWorker() {
 		if de := d.connectGateway(ctx); de != nil {
 			return de
@@ -441,10 +494,10 @@ func (d *Deployer) recordRelease() {
 	}
 	d.dep.markState(func(s *ServerState) {
 		if n := len(s.Releases); n > 0 && s.Releases[n-1].SHA == sha {
-			return // the same commit is already on top, no duplicate
+			return // тот же коммит уже сверху — не дублируем
 		}
 		s.Releases = append(s.Releases, Release{SHA: sha, At: time.Now().UTC().Format(time.RFC3339)})
-		if len(s.Releases) > 10 { // keep only the last 10 versions
+		if len(s.Releases) > 10 { // держим только последние 10 версий
 			s.Releases = append([]Release(nil), s.Releases[len(s.Releases)-10:]...)
 		}
 	})
@@ -496,10 +549,59 @@ func shortSHA(s string) string {
 	return s
 }
 
-// installAccessKey generates an ed25519 key, puts the public half into the server's
-// authorized_keys, encrypts the private half and stores it in the database, so redeploys and CD
-// run without the user's password. It stays quiet: if anything fails the deploy is unaffected,
-// there is just no automatic redeploy.
+// cleanupFailedSite removes the site from the shared gateway when the project never came up.
+// Why: the "Caddy" step writes the domain into the gateway BEFORE the build, so a deploy that died
+// during the build or the health check used to leave the domain hanging. The user opened it and saw
+// a 502 instead of an honest "no such site", and the gateway config collected junk from failed tries.
+//
+// A project that already worked is left alone: if a redeploy fails the site keeps serving the old
+// version, and dropping its config would take a working site down over a failed update.
+func (d *Deployer) cleanupFailedSite() {
+	if d.dep.IsWorker() || len(d.dep.ServerState.Releases) > 0 {
+		return
+	}
+	name := filepath.Base(d.dir)
+	sites := gatewayDir + "/sites"
+	cmd := "rm -f " + sq(sites+"/"+name+".caddy") +
+		"; if [ -n \"$(ls -A " + sq(sites) + " 2>/dev/null)\" ]; then" +
+		" (cd " + sq(gatewayDir) + " && docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile) 2>/dev/null || true;" +
+		" else (cd " + sq(gatewayDir) + " && docker compose down) 2>/dev/null || true; fi"
+
+	// Own context: the step context may have already timed out, and we still have to clean up.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := d.ssh.Run(ctx, d.priv(cmd), func(string) {}); err != nil {
+		return
+	}
+	d.dep.log("", KindOut, "Убрал незавершённый сайт из шлюза: домен больше не отдаёт 502")
+}
+
+// keepAccessKey: the deploy came in on the key the user granted. We add no second key, we just
+// remember this one for redeploys and CD. Exactly one line of ours stays in authorized_keys: the one
+// the user saw when adding it, and the one the revoke command takes away.
+func (d *Deployer) keepAccessKey() {
+	if len(d.encKey) == 0 || d.j == nil || d.j.accessPEM == "" {
+		return
+	}
+	enc, err := encrypt(d.encKey, d.j.accessPEM)
+	if err != nil {
+		return
+	}
+	d.dep.mu.Lock()
+	d.dep.sshKeyEnc = enc
+	d.dep.mu.Unlock()
+	d.dep.markState(func(s *ServerState) { s.AccessKey = true })
+	if d.repo != nil {
+		c, cc := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = d.repo.SaveSSHKey(c, d.dep.ID, enc)
+		cc()
+	}
+	d.dep.log("connect", KindOK, "Работаю по ключу, который ты выдал. Новых ключей не добавляю")
+}
+
+// installAccessKey generates an ed25519 key, puts the public half into the server's authorized_keys,
+// encrypts the private half and stores it, so redeploys and CD run without the user's password.
+// Quiet: if something goes wrong the deploy is fine, there just will be no auto redeploy.
 func (d *Deployer) installAccessKey() {
 	if len(d.encKey) == 0 {
 		return
@@ -551,8 +653,7 @@ func (d *Deployer) createSuperuser(ctx context.Context) *DeployError {
 	return nil
 }
 
-// composeFiles is the -f set for docker compose (a web project adds our Caddy overlay, a worker
-// does not).
+// composeFiles is the -f set for docker compose (web adds our Caddy overlay, a worker does not).
 func (d *Deployer) composeFiles() string {
 	if d.dep.IsWorker() {
 		return "-f docker-compose.yml"
@@ -585,9 +686,8 @@ func (d *Deployer) djangoTasks(ctx context.Context) *DeployError {
 	return nil
 }
 
-// provisionVPN (soft) brings up AmneziaWG (WireGuard with obfuscation) and writes a client
-// config into .djaploy/wg-client.conf. The user imports it into AmneziaVPN or Happ. Never fails
-// the deploy.
+// provisionVPN (soft) brings up AmneziaWG (WireGuard with obfuscation) plus the client config
+// in .djaploy/wg-client.conf. The user imports it into AmneziaVPN/Happ. Never fails a deploy.
 func (d *Deployer) provisionVPN(ctx context.Context) *DeployError {
 	d.dep.log("vpn", KindStep, "Поднимаю AmneziaWG (приватный VPN до сервера) и готовлю конфиг…")
 	cfgDir := d.dir + "/.djaploy"
@@ -606,9 +706,9 @@ OBF="Jc = 4\nJmin = 40\nJmax = 70\nS1 = 50\nS2 = 100\nH1 = $H1\nH2 = $H2\nH3 = $
 	script := `set -e
 export DEBIAN_FRONTEND=noninteractive
 WGDIR=/etc/amnezia/amneziawg
-# REUSE (multi-site): there is ONE VPN per server. If awg0 is already up because another site
-# brought it up, we do NOT touch the tunnel (that would break the neighbour's VPN) and only
-# regenerate THIS project's client config from the existing keys, port and obfuscation, then exit.
+# ПЕРЕИСПОЛЬЗОВАНИЕ (мульти-сайт): VPN — ОДИН на сервер. Если awg0 уже поднят (его поднял
+# другой сайт), НЕ трогаем туннель (иначе у соседнего сайта отвалится VPN), а лишь регенерим
+# клиентский конфиг ЭТОГО проекта из существующих ключей/порта/обфускации и выходим.
 if command -v awg >/dev/null 2>&1 && awg show awg0 >/dev/null 2>&1 && [ -f "$WGDIR/client_private.key" ] && [ -f "$WGDIR/awg0.conf" ]; then
   mkdir -p ` + sq(cfgDir) + `
   CPRIV=$(cat "$WGDIR/client_private.key")
@@ -620,14 +720,14 @@ if command -v awg >/dev/null 2>&1 && awg show awg0 >/dev/null 2>&1 && [ -f "$WGD
   echo "VPN_REUSED (порт $PORT)"
   exit 0
 fi
-# AmneziaWG is WireGuard plus obfuscation (it gets through DPI blocking). Installed from the Amnezia PPA.
+# AmneziaWG = WireGuard + обфускация (обходит DPI-блокировки). Ставим из PPA Amnezia.
 apt-get install -y -o Dpkg::Options::=--force-confnew software-properties-common curl iproute2 >/dev/null 2>&1 || true
-# kernel headers: AmneziaWG installs as a DKMS module and is built against the running kernel
+# заголовки ядра — AmneziaWG ставится DKMS-модулем и собирается под текущее ядро
 apt-get install -y "linux-headers-$(uname -r)" >/dev/null 2>&1 || apt-get install -y linux-headers-generic >/dev/null 2>&1 || true
 add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 || true
-# on fresh or unusual Ubuntu the PPA may have no packages for our release (404), so we normalize
-# the codename to the noble LTS. AmneziaWG installs as a DKMS module (built against the running
-# kernel), so the noble package fits and apt is not poisoned by a broken repository.
+# на свежих/нестандартных Ubuntu у PPA может не быть пакетов под наш релиз (404) →
+# нормализуем кодовое имя на LTS noble. AmneziaWG ставится DKMS-модулем (собирается под
+# текущее ядро), поэтому пакет с noble подходит, а apt не отравляется битым репозиторием.
 for f in /etc/apt/sources.list.d/*amnezia*; do
   [ -f "$f" ] && sed -ri 's#(/ppa/ubuntu) +[a-z][a-z0-9]+ #\1 noble #; s/^(Suites:).*/\1 noble/' "$f" || true
 done
@@ -645,14 +745,14 @@ ENDPOINT=$(curl -s --max-time 5 https://api.ipify.org || echo ` + sq(d.dep.Serve
 EXTIF=$(ip route show default | awk '/default/ {print $5; exit}')
 [ -n "$EXTIF" ] || EXTIF=eth0
 ` + obf + `
-# first take down OUR old tunnel (it may be left over from a previous deploy or from autostart)
-# to free our own port before picking one.
+# сначала снимаем НАШ старый туннель (если остался от прошлого деплоя/автозапуска) —
+# освобождаем свой порт перед подбором.
 systemctl stop awg-quick@awg0 >/dev/null 2>&1 || true
 awg-quick down awg0 >/dev/null 2>&1 || true
 ip link delete awg0 >/dev/null 2>&1 || true
 sleep 1
-# pick a free UDP port automatically (51820..51830) so we can live next to someone else's VPN
-# instead of failing with "Address already in use".
+# автоподбор свободного UDP-порта (51820..51830) — чтобы ужиться с чужим VPN на сервере,
+# а не падать с "Address already in use".
 PORT=""
 for p in $(seq 51820 51830); do
   ss -uln 2>/dev/null | grep -qE ":$p[[:space:]]" || { PORT=$p; break; }
@@ -761,7 +861,7 @@ func (d *Deployer) health(ctx context.Context) *DeployError {
 	url := "https://" + d.dep.Domain + "/"
 	last := "нет ответа"
 	tlsIssue := false
-	for i := 0; i < 18; i++ { // roughly up to 2 minutes
+	for i := 0; i < 18; i++ { // ~ до 2 минут
 		select {
 		case <-ctx.Done():
 			return derr("health_failed",
@@ -820,7 +920,7 @@ func isNetworkErr(out string) bool {
 		"could not resolve host",
 		"unable to connect",
 		"failed to fetch",
-		"unable to locate package", // fallout from a failed apt-get update
+		"unable to locate package", // следствие неудачного apt-get update
 		"connection timed out",
 		"i/o timeout",
 		"tls handshake timeout",

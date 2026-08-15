@@ -15,9 +15,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// genSSHKey generates an ed25519 pair: the private half as PEM (OpenSSH) and the authorized_keys
-// line. The user never sees these keys: we put the public one on their server, then encrypt and
-// store the private one.
+// genSSHKey makes an ed25519 pair: the private key in PEM (OpenSSH) and the authorized_keys line.
+// The user never sees them: the public half goes to their server, the private one is encrypted and stored.
 func genSSHKey() (privPEM, authLine string, err error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -37,8 +36,7 @@ func genSSHKey() (privPEM, authLine string, err error) {
 	return privPEM, authLine, nil
 }
 
-// pubLineFromPriv derives the authorized_keys line from the private PEM, so a purge can remove
-// our key again.
+// pubLineFromPriv rebuilds the authorized_keys line from the private PEM (to strip our key on purge).
 func pubLineFromPriv(privPEM string) (string, error) {
 	signer, err := ssh.ParsePrivateKey([]byte(privPEM))
 	if err != nil {

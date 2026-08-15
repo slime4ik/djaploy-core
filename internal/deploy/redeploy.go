@@ -44,7 +44,7 @@ func runRedeploy(ctx context.Context, repo *Repo, dep *Deployment, keyPEM, token
 	}
 	steps = append(steps, stepDef{"up", 18 * time.Minute, false, d.composeUp})
 	// Django: migrate and collectstatic run on redeploy too, since new code may bring new migrations.
-	if frameworkOrDefault(dep.ServerState.Framework) == frameworkDjango {
+	if dep.RunsDjangoTasks() {
 		steps = append(steps, stepDef{"django", 5 * time.Minute, true, d.djangoTasks})
 	}
 	if !dep.IsWorker() {
@@ -74,7 +74,7 @@ func runRedeploy(ctx context.Context, repo *Repo, dep *Deployment, keyPEM, token
 		persist(repo, dep, false)
 	}
 
-	d.recordRelease() // remember the new commit in case of a later rollback
+	d.recordRelease() // запомнить новый коммит — для возможного отката
 	dep.setURL("https://" + dep.Domain)
 	dep.setStatus(StatusSuccess)
 	dep.log("", KindOK, "Обновлено ✓  https://"+dep.Domain)
@@ -136,8 +136,9 @@ func runRollback(ctx context.Context, repo *Repo, dep *Deployment, keyPEM, token
 		persist(repo, dep, false)
 	}
 
-	// Success: when we stepped back from a working top, that top is removed. When we restored the
-	// last working version after a failure (target == top), the stack stays as it is.
+	// success: if we stepped one release back from a working head, drop that head.
+	// If we were restoring the last working version after a failure (target == head),
+	// leave the stack alone.
 	dep.markState(func(s *ServerState) {
 		if n := len(s.Releases); n >= 2 && s.Releases[n-1].SHA != targetSHA {
 			s.Releases = s.Releases[:n-1]
@@ -170,8 +171,7 @@ func rollbackSteps(worker bool) []StepState {
 	return steps
 }
 
-// pull fetches fresh code without losing the .env or the data: git fetch plus reset --hard,
-// which leaves untracked files such as .env and Caddyfile alone.
+// pull brings fresh code without losing .env or data: git fetch + reset --hard (untracked .env/Caddyfile stay).
 func (d *Deployer) pull(ctx context.Context) *DeployError {
 	d.dep.log("pull", KindStep, "Тяну свежий код (git fetch + reset)…")
 	script := "set -e\ncd " + sq(d.dir) + "\n" +

@@ -13,11 +13,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// ErrInstallationGone means GitHub answered 404 or 401: the app installation was deleted or
-// revoked. The caller can drop the dead installation_id and treat the account as not connected.
+// ErrInstallationGone means GitHub answered 404/401: the app installation was deleted or revoked.
+// The caller can clear the dead installation_id and treat it as "not connected".
 var ErrInstallationGone = errors.New("github installation gone")
 
-// httpClient has a hard timeout so a call to GitHub never hangs until nginx gives up with a 504.
+// httpClient has a hard timeout so a request to GitHub never hangs until the nginx timeout (504).
 var httpClient = &http.Client{Timeout: 12 * time.Second}
 
 func loadPrivateKey(path string) (*rsa.PrivateKey, error) {

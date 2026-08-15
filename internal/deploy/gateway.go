@@ -5,14 +5,14 @@ import (
 	"path/filepath"
 )
 
-// --- Gateway model: one shared Caddy per server for several sites (see docs/multisite.md).
-// This file holds the lifecycle building blocks; templates.go renders the files they write.
+// --- gateway model: one shared Caddy per server for several sites (see MULTISITE_DESIGN.md).
+// These are the building blocks of its lifecycle. They are wired into the main deploy path as a
+// SEPARATE phase (tested on a throwaway VPS); for now renderCaddyfile/composeUp work as before.
 
 const gatewayDir = "/opt/djaploy/_gateway"
 
-// ensureGateway creates the shared Caddy stack idempotently: the shared network, the folders,
-// the compose file, the root Caddyfile, and then brings it up. It leaves existing sites alone and
-// is safe to call again.
+// ensureGateway creates (idempotently) the shared Caddy stack: the shared network, folders, compose,
+// the root Caddyfile, and brings it up. Existing sites are untouched. Safe to call again.
 func (d *Deployer) ensureGateway(ctx context.Context) error {
 	// the shared network the gateway uses to reach project app and grafana containers by alias
 	if err := d.run(ctx, "gateway", d.priv("docker network create "+gwNet+" 2>/dev/null || true")); err != nil {
@@ -31,11 +31,10 @@ func (d *Deployer) ensureGateway(ctx context.Context) error {
 	return d.run(ctx, "gateway", d.priv("cd "+gatewayDir+" && docker compose up -d 2>&1"))
 }
 
-// writeSiteSnippetFile writes or updates the site config in the gateway WITHOUT reloading. The
-// reload happens separately after ensureGateway: on a first deploy the file has to exist BEFORE
-// Caddy starts, otherwise the import matches nothing.
+// writeSiteSnippetFile writes or updates the site config in the gateway (WITHOUT a reload). The reload
+// comes after ensureGateway: on a first deploy the file must exist BEFORE Caddy starts (or import is empty).
 func (d *Deployer) writeSiteSnippetFile() error {
-	name := filepath.Base(d.dir) // project name = folder in /opt/djaploy = network alias and static path
+	name := filepath.Base(d.dir) // имя проекта = папка в /opt/djaploy = алиас/путь статики
 	return d.writeFile(gatewayDir+"/sites/"+name+".caddy", renderSiteSnippet(d.dep, name), "644")
 }
 
@@ -45,10 +44,9 @@ func (d *Deployer) reloadGateway(ctx context.Context) error {
 	return d.run(ctx, "gateway", d.priv(cmd))
 }
 
-// setupGateway is the "caddy" deploy step for a WEB project. It is idempotent: static folders,
-// the overlay (monitoring plus bind volumes), the site snippet, then the shared Caddy is brought
-// up. Attaching the app to the gateway network happens AFTER composeUp (the app has to be running
-// first) in connectGateway.
+// setupGateway is the "caddy" deploy step for a WEB project (gateway model). Idempotent: static folders,
+// the overlay (monitoring plus bind volumes), the site snippet, bringing the shared Caddy up. Attaching
+// the app to the gateway network happens AFTER composeUp (the app must come up first), in connectGateway.
 func (d *Deployer) setupGateway(ctx context.Context) *DeployError {
 	d.dep.log("caddy", KindStep, "Настраиваю общий Caddy-шлюз (HTTPS, несколько сайтов на сервер)…")
 
@@ -73,8 +71,7 @@ func (d *Deployer) setupGateway(ctx context.Context) *DeployError {
 			}
 		}
 	}
-	// the site snippet file goes in first, then the shared Caddy (now with at least one site).
-	// The app is attached after up.
+	// the site snippet (a file) → the shared Caddy (now with at least one site). The app is attached after up.
 	if err := d.writeSiteSnippetFile(); err != nil {
 		return derr("gateway_failed", "Не удалось записать конфиг сайта в шлюз.", "Проблема доступа/места на сервере.")
 	}
@@ -89,30 +86,26 @@ func (d *Deployer) setupGateway(ctx context.Context) *DeployError {
 	return nil
 }
 
-// connectGateway runs AFTER composeUp: it attaches the project app (and grafana) to the shared
-// gateway network under the aliases app-<project> and grafana-<project> so Caddy can reach them,
-// then reloads. composeUp calls it for web projects, which covers deploy, redeploy and rollback in
-// one place. docker network connect is ADDITIVE, so the app keeps its own network to db and redis.
-// The `|| true` is there because on a redeploy it is already attached.
+// connectGateway runs AFTER composeUp: it attaches the project's app (and grafana) to the shared gateway
+// network under the app-<project> / grafana-<project> aliases so Caddy can reach them, then reloads. Called
+// from composeUp for web projects, which covers deploy, redeploy and rollback in one place. docker network
+// connect is ADDITIVE, so the app keeps its network to db and redis. || true: on a redeploy it is attached.
 func (d *Deployer) connectGateway(ctx context.Context) *DeployError {
 	name := filepath.Base(d.dir)
 	base := "cd " + sq(d.dir) + " && docker compose -f docker-compose.yml -f docker-compose.caddy.yml "
-	// Idempotency: the alias app-<name> must point at EXACTLY the live application container.
-	// The bug this fixes: after "unlink and deploy again" an old container with the same alias could
-	// still hang on the gateway network, and Caddy would round-robin between the live one and the
-	// dead one, so users hit random 502s. So we first detach every container of THIS project from
-	// the gateway network except the live one, then reconnect the live one, which makes the alias
-	// unambiguous.
+	// Idempotent: the app-<name> alias must point at EXACTLY the live application container.
+	// The problem this fixes: after "unlink, then deploy again" an old container with the same alias
+	// could stay on the gateway network, and Caddy would round-robin between the live one and the dead one
+	// (the user catches random 502s). So we first take every container of THIS project off the gateway
+	// network except the live one, then reconnect the live one and the alias becomes unambiguous.
 	sweep := func(svc, alias, idvar string) string {
 		return idvar + "=$(" + base + "ps -q " + sq(svc) + " 2>/dev/null | head -1)\n" +
 			`[ -n "$` + idvar + `" ] || { echo "контейнер сервиса ` + svc + ` не найден"; exit 1; }` + "\n" +
-			// drop the alias from every container of this compose project on the gateway network,
-			// except the live one
+			// drop the alias from every container of this compose project on the gateway network but the live one
 			"for _c in $(docker network inspect " + gwNet + ` -f '{{range $id,$c := .Containers}}{{$id}} {{$c.Name}}{{"\n"}}{{end}}' 2>/dev/null | awk -v a="$` + idvar + `" 'index($1,a)!=1 && $2 ~ /^` + name + `[-_]/ {print $1}'); do` + "\n" +
 			"  docker network disconnect -f " + gwNet + ` "$_c" 2>/dev/null || true` + "\n" +
 			"done\n" +
-			// reconnect the live one: disconnect (in case it was attached with stale state), then
-			// connect with the alias
+			// reconnect the live one: disconnect (in case it was attached in an old state) and connect with the alias
 			"docker network disconnect " + gwNet + ` "$` + idvar + `" 2>/dev/null || true` + "\n" +
 			"docker network connect --alias " + alias + "-" + name + " " + gwNet + ` "$` + idvar + `"` + "\n"
 	}

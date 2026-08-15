@@ -7,16 +7,15 @@ import (
 	"github.com/google/uuid"
 )
 
-// User is the profile. The providers (GitHub and GitLab) are optional, 0 means not attached, and
-// at least one of them is always present. Username and AvatarURL come from the provider of the
-// first sign-in.
+// User is a profile. The providers (GitHub/GitLab) are optional: 0 means not linked,
+// but at least one is always there. Username/AvatarURL come from the first login provider.
 type User struct {
 	ID             string    `json:"-"`
-	GitHubID       int64     `json:"id"` // 0 means not attached (the user signed in through GitLab)
+	GitHubID       int64     `json:"id"` // 0 = не привязан (вход был через GitLab)
 	InstallationID *int64    `json:"-"`
 	Username       string    `json:"login"`
 	AvatarURL      string    `json:"avatar_url"`
-	GitLabID       int64     `json:"-"` // 0 means not attached
+	GitLabID       int64     `json:"-"` // 0 = не привязан
 	GitLabUsername string    `json:"gitlab_login,omitempty"`
 	IsActive       bool      `json:"-"`
 	CreatedAt      time.Time `json:"-"`
@@ -33,7 +32,7 @@ func NewUser(github_id int64, username, avatar_url string) *User {
 	}
 }
 
-// NewUserGitLab is a user whose first sign-in was through GitLab, so github_id stays empty.
+// NewUserGitLab builds a user who signed in through GitLab for the first time (github_id empty).
 func NewUserGitLab(gitlabID int64, username, avatarURL string) *User {
 	return &User{
 		ID:             uuid.New().String(),

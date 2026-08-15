@@ -8,24 +8,23 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ActiveChecker verifies that a user is not banned. *UserService implements it.
-// It is an interface so the middleware can be tested with a mock.
+// ActiveChecker verifies the user is not banned. Implemented by *UserService.
+// It is an interface so the middleware can be covered by tests with a mock.
 type ActiveChecker interface {
 	IsActive(ctx context.Context, userID string) (bool, error)
 }
 
-// CookieClearer holds the cookie settings used to clear a session on a ban (taken from cfg).
+// CookieClearer holds the cookie clearing parameters for a ban (taken from cfg).
 type CookieClearer struct {
 	Domain string
 	Secure bool
 }
 
 // RequireActive is the middleware that blocks banned users (is_active=false).
-// It goes AFTER JWTMiddleware, since it reads user_id from the context. A banned user gets their
-// cookies cleared and a 403, which the frontend turns into a sign-out.
-// It fails open on a database error: an outage must NOT sign everybody out. Banning is a rare
-// admin action, a second of leeway during an outage is harmless, and a client cannot cause the
-// outage to get around the check.
+// It goes AFTER JWTMiddleware (it takes user_id from the context). A banned user gets their
+// cookies cleared and a 403, which the frontend sees and logs them out.
+// fail-open on a database error: a database outage must NOT log everyone out (a ban is a rare
+// admin action, a second during an outage is not critical, and a client cannot fake the outage).
 func RequireActive(checker ActiveChecker, cookie CookieClearer) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID := c.GetString("user_id")
@@ -35,7 +34,7 @@ func RequireActive(checker ActiveChecker, cookie CookieClearer) gin.HandlerFunc 
 		}
 		active, err := checker.IsActive(c.Request.Context(), userID)
 		if err != nil {
-			log.Printf("auth: ban check for %s failed, letting the request through: %v", userID, err)
+			log.Printf("auth: проверка бана для %s не удалась (пропускаю): %v", userID, err)
 			c.Next()
 			return
 		}

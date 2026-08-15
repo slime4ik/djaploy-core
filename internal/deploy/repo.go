@@ -58,10 +58,9 @@ func (r *Repo) UsedHostPorts(ctx context.Context, serverIP, excludeID string) []
 	return out
 }
 
-// DomainInUse reports whether the domain is taken by another ACTIVE deploy of this user, which
-// guards against a duplicate domain and the gateway and certificate conflict that follows. It
-// returns the name or repo of the project holding it. excludeID is the current deploy, so a
-// redeploy does not count itself; pass "" for a new one.
+// DomainInUse reports whether the domain is taken by another ACTIVE deploy of this user (a guard against
+// reusing a domain by accident, which would collide in the gateway and in certificates). Returns the name/repo.
+// excludeID is the current deploy (a redeploy must not count itself), "" for a new one.
 func (r *Repo) DomainInUse(ctx context.Context, domain, userID, excludeID string) (string, bool) {
 	var repo, name string
 	err := r.db.QueryRowContext(ctx, `
@@ -77,10 +76,9 @@ func (r *Repo) DomainInUse(ctx context.Context, domain, userID, excludeID string
 	return repo, true
 }
 
-// RepoOnServer reports whether this repository is ALREADY deployed on this server for the same
-// user. It matters because the directory, the containers and the gateway snippet are all keyed by
-// repo name, so a second deploy of the same repo onto the same server would overwrite the first.
-// It returns the name or domain of the project holding it.
+// RepoOnServer reports whether this repository is ALREADY deployed on this server (same user). It
+// matters: the directory, the containers and the gateway snippet are named after the repo, so a
+// second deploy of the same repo to the same server overwrites the first. Returns name/domain.
 func (r *Repo) RepoOnServer(ctx context.Context, repo, serverIP, userID, excludeID string) (string, bool) {
 	var domain, name string
 	err := r.db.QueryRowContext(ctx, `
@@ -301,15 +299,15 @@ type DeploymentSummary struct {
 	ID         string `json:"id"`
 	Repo       string `json:"repo"`
 	Provider   string `json:"provider"`
-	Name       string `json:"name"` // custom project name (empty means domain or repo)
+	Name       string `json:"name"` // кастомное имя проекта (пусто → домен/repo)
 	Domain     string `json:"domain"`
-	ServerIP   string `json:"server_ip"`   // used to group projects by server in the dashboard
-	ServerName string `json:"server_name"` // custom server name (empty means the IP)
+	ServerIP   string `json:"server_ip"`   // для группировки проектов по серверу в дашборде
+	ServerName string `json:"server_name"` // кастомное имя сервера (пусто → IP)
 	Status     string `json:"status"`
-	Health     string `json:"health"` // up|down|"": live health of the site from the uptime monitor
+	Health     string `json:"health"` // up|down|"" — живое здоровье сайта (монитор аптайма)
 	URL        string `json:"url,omitempty"`
-	TeamID     string `json:"team_id,omitempty"` // non-empty means a team project
-	Mine       bool   `json:"mine"`              // whether the caller owns the row, so the UI can mark team projects
+	TeamID     string `json:"team_id,omitempty"` // непустой = проект команды
+	Mine       bool   `json:"mine"`              // я ли владелец записи (для UI «чужой» проект команды)
 	CreatedAt  string `json:"created_at"`
 }
 
@@ -405,7 +403,7 @@ func (r *Repo) DeleteFailedTarget(ctx context.Context, userID, repo, provider, s
 }
 
 // Delete removes the project row, which unlinks it from our service. Access is checked in the
-// service layer (owner or team member), so this one works by id alone.
+// member), so this one works by id alone.
 func (r *Repo) Delete(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM deployments WHERE id=$1`, id)
 	if err != nil {

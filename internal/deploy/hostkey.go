@@ -8,11 +8,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Host key verification (trust on first use): the first connection records the server's
-// fingerprint and every later one is checked against it. On a mismatch the connection is dropped
-// BEFORE authentication, so no password and no token reach that server. The pin lives in
-// server_host_keys keyed by user and IP: one server means one fingerprint for all of that user's
-// projects.
+// Host key check (trust on first use): the first connection pins the server fingerprint,
+// every later one verifies it. On a mismatch we drop the connection BEFORE authentication, so
+// no password and no token reach that server. The pin lives in server_host_keys per user+IP
+// (one server = one fingerprint across all of that user's projects).
 //
 // The owner comes from dep.UserID (the record owner), not from the acting user. Otherwise a team
 // member who opened the logs would pin a second row under their own name.
@@ -101,9 +100,8 @@ func hostKeyError(err error, ip string) *DeployError {
 	return nil
 }
 
-// errHostKeyMismatch is the wording for a server answering with a different key. The user needs
-// both fingerprints, to compare against the provider console, and both scenarios: they rebuilt the
-// server themselves, or they did not.
+// errHostKeyMismatch is the text for a server that answers with a different key. The user needs both
+// fingerprints (to compare with the provider console) and both scenarios: they rebuilt it, or someone else did.
 func errHostKeyMismatch(ip, expected, got string) *DeployError {
 	return derr("host_key_mismatch",
 		"Сервер "+ip+" предъявил ДРУГОЙ SSH-ключ, чем при первом подключении. Соединение разорвано, на сервере ничего не выполнялось.",

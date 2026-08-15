@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,16 +16,16 @@ const (
 
 // Log line kinds. The frontend colours lines by them.
 const (
-	KindOut   = "out"   // plain command output
-	KindStep  = "step"  // a step starts
-	KindOK    = "ok"    // success
-	KindError = "error" // failure
-	KindDone  = "done"  // terminal line, the log stream closes after it
+	KindOut   = "out"   // обычный вывод команды
+	KindStep  = "step"  // начало шага
+	KindOK    = "ok"    // успех
+	KindError = "error" // ошибка
+	KindDone  = "done"  // терминальная строка — поток лога закрывается
 )
 
 const (
-	maxStoredLogs = 2000 // cap on log size stored in the database
-	maxLiveLogs   = 4000 // cap on the in-memory log buffer, so a chatty build does not bloat the worker
+	maxStoredLogs = 2000 // ограничение размера лога в БД
+	maxLiveLogs   = 4000 // кап буфера логов в памяти — чтобы воркер не пух на «болтливых» сборках
 )
 
 type LogLine struct {
@@ -43,26 +44,34 @@ type StepState struct {
 // ServerState records what our service has done on the user's server. It is the source of
 // truth: the service always knows the server's current state and does not undo its own work.
 type ServerState struct {
-	ProjectType     string   `json:"project_type"`     // web (domain + Caddy + HTTPS) | worker (bot or worker, no ports)
-	Framework       string   `json:"framework"`        // django | other. Django specifics (ALLOWED_HOSTS/CSRF/DEBUG, superuser) are added for django only
-	Fail2ban        bool     `json:"fail2ban"`         // fail2ban is configured
-	Docker          bool     `json:"docker"`           // Docker is installed
-	RegistryMirrors bool     `json:"registry_mirrors"` // registry mirrors are written
-	Caddy           bool     `json:"caddy"`            // our Caddy layer is in place (automatic HTTPS)
-	AccessKey       bool     `json:"access_key"`       // our SSH access key is installed
-	DeployUser      string   `json:"deploy_user"`      // non-empty means we deploy as a non-root user
-	ProjectDir      string   `json:"project_dir"`      // where the project lives on the server
-	VPN             bool     `json:"vpn"`              // our VPN access is up (AmneziaWG)
-	VPNPaths        []string `json:"vpn_paths"`        // paths reachable only over the VPN or from allowed IPs (404 from outside)
-	AllowedIPs      []string `json:"allowed_ips"`      // trusted IPs and subnets for protected paths (the user's own VPN or office)
-	Grafana         bool     `json:"grafana"`          // Grafana is up at /grafana
-	HostPort        int      `json:"host_port"`        // host port of the app for the shared Caddy gateway (multi-site)
-	GrafanaPort     int      `json:"grafana_port"`     // host port of grafana for the gateway (0 means none)
-	LastBuiltAt     string   `json:"last_built_at"`    // when we last built and started it
-	UpdatedAt       string   `json:"updated_at"`       // when this state was last updated
+	ProjectType     string   `json:"project_type"`     // web (домен+Caddy+HTTPS) | worker (бот/воркер, без портов)
+	Framework       string   `json:"framework"`        // django | other — Django-специфику (ALLOWED_HOSTS/CSRF/DEBUG, суперюзер) добавляем только для django
+	Fail2ban        bool     `json:"fail2ban"`         // настроен fail2ban
+	Docker          bool     `json:"docker"`           // установлен Docker
+	RegistryMirrors bool     `json:"registry_mirrors"` // прописаны зеркала реестра
+	Caddy           bool     `json:"caddy"`            // положен наш Caddy-слой (авто-HTTPS)
+	AccessKey       bool     `json:"access_key"`       // установлен наш SSH-ключ доступа
+	DeployUser      string   `json:"deploy_user"`      // непустой = деплоим под non-root юзером
+	ProjectDir      string   `json:"project_dir"`      // где проект лежит на сервере
+	VPN             bool     `json:"vpn"`              // поднят наш VPN-доступ (AmneziaWG)
+	VPNPaths        []string `json:"vpn_paths"`        // пути, доступные только из VPN / с разрешённых IP (404 снаружи)
+	AllowedIPs      []string `json:"allowed_ips"`      // доверенные IP/подсети к защищённым путям (свой VPN/офис юзера)
+	Grafana         bool     `json:"grafana"`          // поднята Grafana на /grafana
+	HostPort        int      `json:"host_port"`        // host-порт app для общего Caddy-gateway (мульти-сайт)
+	GrafanaPort     int      `json:"grafana_port"`     // host-порт grafana для gateway (0 = нет)
+	LastBuiltAt     string   `json:"last_built_at"`    // когда последний раз собирали/поднимали
+	UpdatedAt       string   `json:"updated_at"`       // когда состояние обновлялось
 
-	// Releases is the stack of successfully deployed commits (the last one is current). Rollback
-	// pops the last element and deploys the previous one.
+	// CheckPath is what the uptime monitor pings. Empty = the site root (the way it always was).
+	// A custom path helps when the home page is heavy (hits the database) or when you want to answer
+	// 500 while degraded: the monitor treats anything below 500 as alive.
+	CheckPath string `json:"check_path,omitempty"`
+	// SkipDjangoTasks turns migrate/collectstatic off for deploys and redeploys. The flag is
+	// inverted (false by default) so nothing changes for existing projects.
+	SkipDjangoTasks bool `json:"skip_django_tasks,omitempty"`
+
+	// Releases is the stack of successfully deployed commits (the last one is current). For rolling
+	// back: a rollback pops the last entry and deploys the previous one.
 	Releases []Release `json:"releases,omitempty"`
 }
 
@@ -134,24 +143,24 @@ func defaultSteps(withSuperuser, withVPN, nonRoot, worker, withDjango bool) []St
 type Deployment struct {
 	ID       string `json:"id"`
 	UserID   string `json:"user_id"`
-	TeamID   string `json:"team_id,omitempty"` // non-empty means a team project (visible to every member)
+	TeamID   string `json:"team_id,omitempty"` // непустой = проект команды (виден всем участникам)
 	Repo     string `json:"repo"`
-	Provider string `json:"provider"` // github | gitlab: where we clone from and how we get a token
-	Name     string `json:"name"`     // custom project name (empty means we show the domain or repo)
+	Provider string `json:"provider"` // github | gitlab — откуда клоним и как получаем токен
+	Name     string `json:"name"`     // кастомное имя проекта (пусто → показываем домен/repo)
 	Domain   string `json:"domain"`
 	ServerIP string `json:"server_ip"`
 
 	AppService   string `json:"app_service"`
 	AppPort      int    `json:"app_port"`
-	ServeStatic  bool   `json:"serve_static"` // Caddy serves /static from a volume (otherwise static files live in S3 or in the app)
-	ServeMedia   bool   `json:"serve_media"`  // Caddy serves /media from a volume (separate from static, media often lives in S3)
+	ServeStatic  bool   `json:"serve_static"` // Caddy раздаёт /static из volume (иначе — статика в S3/у app)
+	ServeMedia   bool   `json:"serve_media"`  // Caddy раздаёт /media из volume (отдельно от static — бывает медиа в S3)
 	StaticVolume string `json:"static_volume"`
 	MediaVolume  string `json:"media_volume"`
 	HasSuperuser bool   `json:"has_superuser"`
 
 	SSHUser   string `json:"ssh_user"`
 	CDEnabled bool   `json:"cd_enabled"`
-	Health    string `json:"health"` // up|down|"": live health of the site, written by the uptime monitor
+	Health    string `json:"health"` // up|down|"" — живое здоровье сайта (пишет монитор аптайма)
 
 	ServerState ServerState `json:"server_state"`
 
@@ -165,7 +174,7 @@ type Deployment struct {
 	logs      []LogLine
 	subs      map[chan LogLine]struct{}
 	done      bool
-	sshKeyEnc string // encrypted private access key (for redeploy and CD)
+	sshKeyEnc string // зашифрованный приватный ключ доступа (для редеплоя/CD)
 }
 
 // Repository providers. An empty value in old rows means github.
@@ -206,7 +215,23 @@ func (d *Deployment) IsWorker() bool {
 	return d.ServerState.ProjectType == "worker"
 }
 
-// HasKey reports a stored access key, which means redeploy and CD work without a password.
+// RunsDjangoTasks reports whether migrate + collectstatic should run. Only for Django and only if
+// the user has not turned them off in project settings: not everyone needs migrations on every
+// deploy, and the step costs time.
+func (d *Deployment) RunsDjangoTasks() bool {
+	return frameworkOrDefault(d.ServerState.Framework) == frameworkDjango && !d.ServerState.SkipDjangoTasks
+}
+
+// CheckURL is what the uptime monitor pings: the whole site or the path the user set.
+func (d *Deployment) CheckURL() string {
+	p := d.ServerState.CheckPath
+	if p == "" {
+		return d.URL
+	}
+	return strings.TrimSuffix(d.URL, "/") + p
+}
+
+// HasKey reports whether we have a stored access key (redeploy and CD can run without a password).
 func (d *Deployment) HasKey() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -227,13 +252,13 @@ type DeploymentView struct {
 	ServeStatic  bool         `json:"serve_static"`
 	ServeMedia   bool         `json:"serve_media"`
 	HasSuperuser bool         `json:"has_superuser"`
-	Path         string       `json:"path"` // where the project lives on the user's server
+	Path         string       `json:"path"` // где проект лежит на сервере юзера
 	CDEnabled    bool         `json:"cd_enabled"`
-	CanRedeploy  bool         `json:"can_redeploy"` // an access key exists, so redeploy and CD need no password
-	CanRollback  bool         `json:"can_rollback"` // a previous version exists in history, so rollback is possible
+	CanRedeploy  bool         `json:"can_redeploy"` // есть ключ доступа → редеплой/CD без пароля
+	CanRollback  bool         `json:"can_rollback"` // есть предыдущая версия в истории → можно откатить
 	SSHUser      string       `json:"ssh_user"`
-	Health       string       `json:"health"`       // up|down|"": live health from the uptime monitor
-	ServerState  ServerState  `json:"server_state"` // what our service has done on the server
+	Health       string       `json:"health"`       // up|down|"" — живое здоровье (монитор аптайма)
+	ServerState  ServerState  `json:"server_state"` // что наш сервис сделал на сервере
 	Status       string       `json:"status"`
 	Steps        []StepState  `json:"steps"`
 	Err          *DeployError `json:"error,omitempty"`
@@ -281,13 +306,13 @@ func (d *Deployment) log(step, kind, text string) {
 	d.mu.Lock()
 	l := LogLine{Step: step, Kind: kind, Text: text, TS: time.Now().UnixMilli()}
 	d.logs = append(d.logs, l)
-	if len(d.logs) > maxLiveLogs { // keep the tail only, so memory stays bounded
+	if len(d.logs) > maxLiveLogs { // держим только хвост — память под контролем
 		d.logs = append([]LogLine(nil), d.logs[len(d.logs)-maxLiveLogs:]...)
 	}
 	for ch := range d.subs {
 		select {
 		case ch <- l:
-		default: // a slow subscriber loses the line rather than blocking the deploy
+		default: // подписчик не успевает — пропускаем строку, чтобы не блокировать деплой
 		}
 	}
 	d.mu.Unlock()
@@ -369,6 +394,29 @@ func (s *Store) Get(id string) *Deployment {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.m[id]
+}
+
+// BusyOn reports whether a deploy is running on this server right now (for this owner). Needed so we
+// never revoke access or delete a project out from under a running deploy.
+func (s *Store) BusyOn(userID, ip string) bool {
+	s.mu.RLock()
+	live := make([]*Deployment, 0, len(s.m))
+	for _, d := range s.m {
+		live = append(live, d)
+	}
+	s.mu.RUnlock()
+	for _, d := range live {
+		if d.UserID != userID || d.ServerIP != ip {
+			continue
+		}
+		d.mu.Lock()
+		busy := d.Status == StatusQueued || d.Status == StatusRunning
+		d.mu.Unlock()
+		if busy {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Remove(id string) {

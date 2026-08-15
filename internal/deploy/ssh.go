@@ -25,14 +25,14 @@ type SSH struct{ client *ssh.Client }
 //	Expected != ""  → strict comparison; a mismatch gives HostKeyMismatchError and no connection.
 //	AllowTOFU=false → an unknown server is refused (background jobs never pin keys).
 type HostPin struct {
-	Expected  string // "SHA256:…" from server_host_keys.fingerprint
-	KeyType   string // type of the pinned key (HostKeyAlgorithms is narrowed to it)
+	Expected  string // "SHA256:…" из server_host_keys.fingerprint
+	KeyType   string // тип закреплённого ключа (сужаем HostKeyAlgorithms под него)
 	AllowTOFU bool
 
 	// Filled in by the callback: what the server actually presented.
 	SeenFP   string
 	SeenType string
-	SeenPub  string // authorized_keys line
+	SeenPub  string // строка authorized_keys
 }
 
 // HostKeyMismatchError means the server presented a different key. No connection was made and
@@ -66,12 +66,13 @@ func (p *HostPin) callback(ip string) ssh.HostKeyCallback {
 	}
 }
 
-// algos narrows the host key algorithms to the pinned type. Without it a server holding both an
-// ed25519 and an rsa key may present the one we did not record, and we would call it a mismatch.
+// algos narrows the host key algorithms down to the pinned type. Without it a server that has both
+// ed25519 and rsa can present a different key than the one we remembered, and we would decide the
+// key had been swapped.
 func (p *HostPin) algos() []string {
 	switch p.KeyType {
 	case "":
-		return nil // unknown server: let the usual negotiation happen
+		return nil // незнакомый сервер: пусть договариваются как обычно
 	case ssh.KeyAlgoRSA:
 		// the same rsa host key is offered under three algorithm names
 		return []string{ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSA}
@@ -80,15 +81,14 @@ func (p *HostPin) algos() []string {
 	}
 }
 
-// DialPassword connects with a password, which is what the first deploy uses. We offer BOTH
-// password and keyboard-interactive: many servers (through PAM) accept keyboard-interactive only,
-// and otherwise auth is rejected even though the password is right. The OpenSSH client tries both
-// methods, which is why it works from a terminal.
+// DialPassword connects with a password (the first deploy). We offer BOTH password and
+// keyboard-interactive: many servers (PAM) accept only keyboard-interactive, and otherwise auth is
+// rejected even though the password is right (OpenSSH on a Mac tries both, which is why it works there).
 func DialPassword(ip, user, password string, pin *HostPin) (*SSH, error) {
 	ki := ssh.KeyboardInteractive(func(_, _ string, questions []string, _ []bool) ([]string, error) {
 		ans := make([]string, len(questions))
 		for i := range ans {
-			ans[i] = password // answer every prompt (usually "Password:") with the password
+			ans[i] = password // на каждый запрос (обычно "Password:") отвечаем паролем
 		}
 		return ans, nil
 	})
@@ -152,7 +152,7 @@ func (s *SSH) Run(ctx context.Context, cmd string, logf func(string)) error {
 	scan := func(r io.Reader) {
 		defer wg.Done()
 		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // docker build emits very long lines
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // длинные строки docker build
 		for sc.Scan() {
 			logf(sc.Text())
 		}
@@ -175,8 +175,7 @@ func (s *SSH) Run(ctx context.Context, cmd string, logf func(string)) error {
 	}
 }
 
-// WriteFile writes content to path on the server, piping through stdin into cat so there is
-// nothing to escape.
+// WriteFile writes content to path on the server (through stdin into cat, no escaping headaches).
 func (s *SSH) WriteFile(path, content, mode string) error {
 	sess, err := s.client.NewSession()
 	if err != nil {

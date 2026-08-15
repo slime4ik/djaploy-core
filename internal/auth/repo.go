@@ -9,7 +9,7 @@ import (
 	"github.com/lib/pq"
 )
 
-// ErrProviderTaken means this GitHub or GitLab account is already attached to another profile.
+// ErrProviderTaken means this GitHub/GitLab account is already linked to another profile.
 var ErrProviderTaken = errors.New("provider already linked to another user")
 
 func isUniqueViolation(err error) bool {
@@ -39,8 +39,7 @@ func (r *UserRepo) DoesUserExists(ctx context.Context, githubUserId int64) (stri
 }
 
 func (r *UserRepo) CreateUser(ctx context.Context, u *User) error {
-	// NULLIF(x,0) turns a zero provider id into NULL, so the UNIQUE index does not collide across
-	// the many users who have no such provider
+	// NULLIF(x,0): a zero provider id becomes NULL so UNIQUE does not block many users without one
 	query := `INSERT INTO users (id, github_id, username, avatar_url, gitlab_id, gitlab_username, is_active, created_at)
 		VALUES ($1, NULLIF($2, 0), $3, $4, NULLIF($5, 0), $6, $7, $8)`
 	_, err := r.db.ExecContext(ctx, query,
@@ -81,8 +80,7 @@ func (r *UserRepo) GetProfile(ctx context.Context, userID string) (*User, error)
 	return user, nil
 }
 
-// GetIDByGitLabID returns the user id for a gitlab_id ("" when not found), the GitLab counterpart
-// of DoesUserExists.
+// GetIDByGitLabID returns a user id by gitlab_id ("" = not found), like DoesUserExists for GitHub.
 func (r *UserRepo) GetIDByGitLabID(ctx context.Context, gitlabID int64) (string, error) {
 	var id string
 	err := r.db.QueryRowContext(ctx, `SELECT id FROM users WHERE gitlab_id = $1`, gitlabID).Scan(&id)
@@ -95,8 +93,7 @@ func (r *UserRepo) GetIDByGitLabID(ctx context.Context, gitlabID int64) (string,
 	return id, nil
 }
 
-// AttachGitLab attaches GitLab to an existing profile. If another profile holds it, the result is
-// ErrProviderTaken.
+// AttachGitLab links GitLab to an existing profile. Taken by someone else → ErrProviderTaken.
 func (r *UserRepo) AttachGitLab(ctx context.Context, userID string, gitlabID int64, username, tokenEnc string) error {
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE users SET gitlab_id = $1, gitlab_username = $2, gitlab_token_enc = $3 WHERE id = $4`,
@@ -113,7 +110,7 @@ func (r *UserRepo) AttachGitLab(ctx context.Context, userID string, gitlabID int
 	return nil
 }
 
-// AttachGitHub attaches GitHub to an existing profile, for a user who signed in through GitLab.
+// AttachGitHub links GitHub to an existing profile (the user signed in through GitLab).
 func (r *UserRepo) AttachGitHub(ctx context.Context, userID string, githubID int64) error {
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE users SET github_id = $1 WHERE id = $2`, githubID, userID)
@@ -129,8 +126,7 @@ func (r *UserRepo) AttachGitHub(ctx context.Context, userID string, githubID int
 	return nil
 }
 
-// SaveGitLabToken updates the encrypted tokens. The refresh token rotates, so this runs on every
-// renewal.
+// SaveGitLabToken updates the encrypted tokens (the refresh rotates, so we store it every time).
 func (r *UserRepo) SaveGitLabToken(ctx context.Context, userID, tokenEnc string) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE users SET gitlab_token_enc = $1 WHERE id = $2`, tokenEnc, userID)
@@ -140,7 +136,7 @@ func (r *UserRepo) SaveGitLabToken(ctx context.Context, userID, tokenEnc string)
 	return nil
 }
 
-// GetGitLabTokenEnc returns the user's encrypted tokens ("" means GitLab is not attached).
+// GetGitLabTokenEnc returns the user's encrypted tokens ("" = GitLab is not linked).
 func (r *UserRepo) GetGitLabTokenEnc(ctx context.Context, userID string) (string, error) {
 	var enc string
 	err := r.db.QueryRowContext(ctx,
@@ -154,8 +150,7 @@ func (r *UserRepo) GetGitLabTokenEnc(ctx context.Context, userID string) (string
 	return enc, nil
 }
 
-// IsActive reports whether a user is active (not banned). A cheap primary key lookup; a missing
-// user is false.
+// IsActive reports whether the user is active (not banned). A cheap PK lookup. Unknown → false.
 func (r *UserRepo) IsActive(ctx context.Context, userID string) (bool, error) {
 	var active bool
 	err := r.db.QueryRowContext(ctx, `SELECT is_active FROM users WHERE id = $1`, userID).Scan(&active)
@@ -185,8 +180,8 @@ func (r *UserRepo) AddInstallationID(ctx context.Context, GitHubID, installation
 	return nil
 }
 
-// AddInstallationIDByUser attaches an installation to a user by their id from the JWT, with no
-// round trip to GitHub OAuth for a github_id.
+// AddInstallationIDByUser links an installation to a user by their id (from the JWT),
+// without a round trip to GitHub OAuth for the github_id.
 func (r *UserRepo) AddInstallationIDByUser(ctx context.Context, userID string, installationID int64) error {
 	res, err := r.db.ExecContext(ctx,
 		`UPDATE users SET installation_id = $1 WHERE id = $2`, installationID, userID)

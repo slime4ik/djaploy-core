@@ -54,6 +54,14 @@ func (w *Webhook) Handle(c *gin.Context) {
 			FullName      string `json:"full_name"`
 			DefaultBranch string `json:"default_branch"`
 		} `json:"repository"`
+		// who pushed: in the activity feed an "auto deploy" with no author looks like magic,
+		// this way you can see whose push triggered it
+		Pusher struct {
+			Name string `json:"name"`
+		} `json:"pusher"`
+		Sender struct {
+			Login string `json:"login"`
+		} `json:"sender"`
 	}
 	if err := json.Unmarshal(body, &p); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad json"})
@@ -67,7 +75,11 @@ func (w *Webhook) Handle(c *gin.Context) {
 		return
 	}
 
-	triggered, reason := w.svc.RedeployForCD(c.Request.Context(), p.Repository.FullName, ProviderGitHub)
+	pusher := p.Sender.Login
+	if pusher == "" {
+		pusher = p.Pusher.Name
+	}
+	triggered, reason := w.svc.RedeployForCD(c.Request.Context(), p.Repository.FullName, ProviderGitHub, pusher)
 	log.Printf("webhook push %s ref=%s → cd=%v (%s)", p.Repository.FullName, p.Ref, triggered, reason)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "redeploy": triggered, "reason": reason})
 }
@@ -81,9 +93,10 @@ func (w *Webhook) HandleGitLab(c *gin.Context) {
 		return
 	}
 	var p struct {
-		Ref     string `json:"ref"`
-		After   string `json:"after"` // all zeros means the branch was deleted
-		Project struct {
+		Ref      string `json:"ref"`
+		After    string `json:"after"`         // 000..0 = удаление ветки
+		UserName string `json:"user_username"` // кто запушил (для ленты активности)
+		Project  struct {
 			PathWithNamespace string `json:"path_with_namespace"`
 			DefaultBranch     string `json:"default_branch"`
 		} `json:"project"`
@@ -98,7 +111,7 @@ func (w *Webhook) HandleGitLab(c *gin.Context) {
 		return
 	}
 	triggered, reason := w.svc.RedeployForGitLabCD(c.Request.Context(),
-		p.Project.PathWithNamespace, c.GetHeader("X-Gitlab-Token"))
+		p.Project.PathWithNamespace, c.GetHeader("X-Gitlab-Token"), p.UserName)
 	log.Printf("gitlab webhook push %s ref=%s → cd=%v (%s)", p.Project.PathWithNamespace, p.Ref, triggered, reason)
 	if reason == "bad token" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "bad token"})

@@ -25,17 +25,17 @@ import (
 	"github.com/slime4ik/djaploy-core/internal/store"
 )
 
-// linkCookie marks a flow as "linking a second provider to a profile" rather than a login.
-// A private route sets it while the user is already authenticated, and the public callback reads
-// it. It cannot be forged: the cookie belongs to our domain and is httpOnly.
+// linkCookie marks "this is linking a second provider to a profile, not a login".
+// It is set by a private route (the user is already signed in) and read by the public callback.
+// It cannot be forged: it is a cookie on our domain, httpOnly.
 const linkCookie = "link_uid"
 
-// PromoGranter grants the new user promotion (implemented by *billing.Service). true means granted.
+// PromoGranter grants the promo to a new user (implemented by *billing.Service). true = granted.
 type PromoGranter interface {
 	GrantNewUserMax(ctx context.Context, userID string) bool
 }
 
-// ReferralAttributor attributes a new user to their referrer by code (implemented by *referral.Service).
+// ReferralAttributor ties a new user to their referrer by code (implemented by *referral.Service).
 type ReferralAttributor interface {
 	Attribute(ctx context.Context, refCode, referredID string)
 }
@@ -43,23 +43,22 @@ type ReferralAttributor interface {
 type UserHandler struct {
 	s        *UserService
 	cache    *store.RedisCache
-	promo    PromoGranter       // optional: the "Max for new users" promotion
-	referral ReferralAttributor // optional: referral attribution through ?ref
+	promo    PromoGranter       // опционально: акция «Max новым юзерам»
+	referral ReferralAttributor // опционально: реферальная привязка по ?ref
 }
 
 func NewUserHandler(s *UserService, cache *store.RedisCache) *UserHandler {
 	return &UserHandler{s: s, cache: cache}
 }
 
-// SetPromoGranter wires in the promotion (called from main once billing exists).
+// SetPromoGranter wires up the promo grant (called from main after billing is created).
 func (h *UserHandler) SetPromoGranter(p PromoGranter) { h.promo = p }
 
-// SetReferral wires in referral attribution (called from main once referral exists).
+// SetReferral wires up referral attribution (called from main after referral is created).
 func (h *UserHandler) SetReferral(r ReferralAttributor) { h.referral = r }
 
-// attributeReferral binds a brand new user to a referrer when a ?ref code is in the cookie.
-// The frontend sets that cookie on the landing page when someone arrives through a referral link,
-// and we clear it once the attribution is done.
+// attributeReferral ties a brand new user to a referrer when the ?ref code is in the cookie.
+// The cookie is set by the frontend on the landing page for a referral link; we clear it after.
 func (h *UserHandler) attributeReferral(c *gin.Context, isNew bool, userID string) {
 	if !isNew || h.referral == nil {
 		return
@@ -70,10 +69,9 @@ func (h *UserHandler) attributeReferral(c *gin.Context, isNew bool, userID strin
 	c.SetCookie("djaploy_ref", "", -1, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, false)
 }
 
-// dashboardDest is where we send the user after login. A first-time user gets new=1, which the
-// frontend uses to record a signup in analytics; from the client alone a first login is
-// indistinguishable from any other. welcome=max signals the "Max for newcomers" promotion, which
-// is granted right here.
+// dashboardDest decides where to send the user after signing in. A newcomer also gets new=1: the
+// frontend uses it to report a signup to Metrika, because from the client a new login is otherwise
+// indistinguishable from a normal one. welcome=max is the "Max for newcomers" promo, granted here.
 func (h *UserHandler) dashboardDest(ctx context.Context, userID string, isNew bool) string {
 	dest := h.s.cfg.FrontendURL + "/dashboard"
 	if !isNew {
@@ -88,7 +86,7 @@ func (h *UserHandler) dashboardDest(ctx context.Context, userID string, isNew bo
 }
 
 func (h *UserHandler) GitHubCallBack(c *gin.Context) {
-	// 1. take code and state out of the URL
+	// 1. take code and state from the URL
 	code := c.Query("code")
 	githubState := c.Query("state")
 
@@ -100,13 +98,13 @@ func (h *UserHandler) GitHubCallBack(c *gin.Context) {
 	}
 	if cookieState != githubState {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "неверный state"})
-		return // this return matters
+		return // ← обязательно
 	}
 
-	// state is single use, so the cookie goes away
+	// state is single use, so drop the cookie
 	c.SetCookie("state", "", -1, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 
-	// 3. trade the code for a token
+	// 3. exchange the code for a token
 	form := url.Values{}
 	form.Add("client_id", h.s.cfg.GitHubClientID)
 	form.Add("client_secret", h.s.cfg.GitHubClientSecret)
@@ -140,7 +138,7 @@ func (h *UserHandler) GitHubCallBack(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "bad github response"})
 		return
 	}
-	// fetch the user profile
+	// Parse the user profile
 	req, _ = http.NewRequest(http.MethodGet, "https://api.github.com/user", nil)
 	req.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 	req.Header.Set("User-Agent", "djaploy")
@@ -164,7 +162,7 @@ func (h *UserHandler) GitHubCallBack(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "bad github response"})
 		return
 	}
-	// linking mode: the user signed in through GitLab and is attaching GitHub to that profile
+	// link mode: the user signed in through GitLab and is attaching GitHub to their profile
 	if linkUID, lerr := c.Cookie(linkCookie); lerr == nil && linkUID != "" {
 		c.SetCookie(linkCookie, "", -1, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 		dest := h.s.cfg.FrontendURL + "/settings"
@@ -190,19 +188,19 @@ func (h *UserHandler) GitHubCallBack(c *gin.Context) {
 	}
 	// SET tokens INTO cookie
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie("access_token", access, 15*60, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)        // 15 minutes
-	c.SetCookie("refresh_token", refresh, 30*24*3600, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true) // 30 days
+	c.SetCookie("access_token", access, 15*60, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)        // 15 мин
+	c.SetCookie("refresh_token", refresh, 30*24*3600, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true) // 30 дней
 
-	h.attributeReferral(c, isNew, userID) // referral attribution from the ?ref cookie, new users only
+	h.attributeReferral(c, isNew, userID) // реферальная привязка по ?ref-куке (если новый)
 
-	// promotion: a new user gets Max, and the dashboard shows a welcome box (?welcome=max&days=N)
+	// promo: a new user gets Max → the dashboard shows a welcome box (?welcome=max&days=N)
 	c.Redirect(http.StatusFound, h.dashboardDest(c.Request.Context(), userID, isNew))
 }
 
-// DemoLogin is a secret login for payment provider reviewers, with no GitHub involved.
-// GET /api/v1/auth/demo?code=SECRET opens a demo session and redirects to the dashboard.
-// The demo user has no GitHub attached: they see all the content and the plans but cannot deploy.
-const demoGitHubID int64 = 100000000001 // a reserved fake github_id for the demo account
+// DemoLogin is the secret sign-in for YooKassa moderators (no GitHub).
+// GET /api/v1/auth/demo?code=SECRET sets a demo user session and redirects to the dashboard.
+// The demo user has no GitHub link: they see all the content and plans but cannot deploy.
+const demoGitHubID int64 = 100000000001 // зарезервированный фейковый github_id для демо
 
 func (h *UserHandler) DemoLogin(c *gin.Context) {
 	if h.s.cfg.DemoCode == "" || c.Query("code") != h.s.cfg.DemoCode {
@@ -254,7 +252,7 @@ func (h *UserHandler) GitHubAuth(c *gin.Context) {
 
 // ── GitLab OAuth ──────────────────────────────────────────────
 
-// Providers lists the available sign-in methods for the login page. Public endpoint.
+// Providers reports which sign-in methods are available (for the login page, public).
 func (h *UserHandler) Providers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"github": true,
@@ -262,7 +260,7 @@ func (h *UserHandler) Providers(c *gin.Context) {
 	})
 }
 
-// gitLabRedirect is the shared part: set the state cookie and redirect to the GitLab consent form.
+// gitLabRedirect is the shared part: the state cookie plus a redirect to the GitLab consent screen.
 func (h *UserHandler) gitLabRedirect(c *gin.Context) {
 	state := uuid.NewString()
 	c.SetCookie("state", state, 3600, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
@@ -274,18 +272,18 @@ func (h *UserHandler) gitLabRedirect(c *gin.Context) {
 	))
 }
 
-// GitLabAuth signs a user in through GitLab. Public endpoint.
+// GitLabAuth signs in through GitLab (public).
 func (h *UserHandler) GitLabAuth(c *gin.Context) {
 	if !h.s.cfg.GitLabEnabled() {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "вход через GitLab не настроен"})
 		return
 	}
-	// in case a linking flow was started earlier: this one is a plain login
+	// in case a link flow was started earlier, this is a clean login
 	c.SetCookie(linkCookie, "", -1, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 	h.gitLabRedirect(c)
 }
 
-// GitLabLink attaches GitLab to the current profile. Private: the user is already signed in.
+// GitLabLink attaches GitLab to the current profile (private: the user is already signed in).
 func (h *UserHandler) GitLabLink(c *gin.Context) {
 	if !h.s.cfg.GitLabEnabled() {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "GitLab не настроен"})
@@ -300,7 +298,7 @@ func (h *UserHandler) GitLabLink(c *gin.Context) {
 	h.gitLabRedirect(c)
 }
 
-// GitHubLink attaches GitHub to a profile that was created through GitLab. Private endpoint.
+// GitHubLink attaches GitHub to a profile created through GitLab (private).
 func (h *UserHandler) GitHubLink(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -311,7 +309,7 @@ func (h *UserHandler) GitHubLink(c *gin.Context) {
 	h.GitHubAuth(c)
 }
 
-// GitLabCallback is the GitLab callback: either a login OR a link, decided by the link cookie.
+// GitLabCallback is the GitLab callback: a login OR a link (decided by the link cookie).
 func (h *UserHandler) GitLabCallback(c *gin.Context) {
 	if !h.s.cfg.GitLabEnabled() {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "GitLab не настроен"})
@@ -340,7 +338,7 @@ func (h *UserHandler) GitLabCallback(c *gin.Context) {
 		return
 	}
 
-	// linking mode: the user is already signed in, so we just attach GitLab to their profile
+	// link mode: the user is already signed in, we just attach GitLab to their profile
 	if linkUID, lerr := c.Cookie(linkCookie); lerr == nil && linkUID != "" {
 		c.SetCookie(linkCookie, "", -1, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 		dest := h.s.cfg.FrontendURL + "/settings"
@@ -357,7 +355,7 @@ func (h *UserHandler) GitLabCallback(c *gin.Context) {
 		return
 	}
 
-	// a normal login
+	// a normal sign-in
 	access, refresh, userID, isNew, err := h.s.LoginOrCreateUserGitLab(ctx, glUser, tok)
 	if err != nil {
 		log.Printf("gitlab login failed: %v", err)
@@ -368,7 +366,7 @@ func (h *UserHandler) GitLabCallback(c *gin.Context) {
 	c.SetCookie("access_token", access, 15*60, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 	c.SetCookie("refresh_token", refresh, 30*24*3600, "/", h.s.cfg.CookieDomain, h.s.cfg.CookieSecure, true)
 
-	h.attributeReferral(c, isNew, userID) // referral attribution from the ?ref cookie, new users only
+	h.attributeReferral(c, isNew, userID) // реферальная привязка по ?ref-куке (если новый)
 
 	c.Redirect(http.StatusFound, h.dashboardDest(ctx, userID, isNew))
 }
@@ -390,7 +388,7 @@ func (h *UserHandler) GetUserProfile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "не удалось получить профиль"})
 		return
 	}
-	// login and avatar come from the provider of the first sign-in; providers lists what is attached
+	// login and avatar come from the first login provider; providers lists what is attached
 	c.JSON(http.StatusOK, gin.H{
 		"id":           user.GitHubID,
 		"login":        user.Username,
@@ -407,9 +405,9 @@ func (h *UserHandler) GetUserProfile(c *gin.Context) {
 func (h *UserHandler) GitHubAppCallback(c *gin.Context) {
 	dashboard := h.s.cfg.FrontendURL + "/dashboard"
 
-	// This route is private (behind JWT), so the token already tells us who is installing the App.
-	// That is why we do NOT call GitHub OAuth for a github_id, which is what used to hang the
-	// callback into a 504. We attach the installation to the current user directly.
+	// The route is private (behind JWT), so we already know from the token who is installing the App.
+	// That is why we do NOT go to GitHub OAuth for the github_id (which is what used to hang the
+	// callback into a 504), we attach the installation to the current user directly.
 	userID := c.GetString("user_id")
 	installationID, err := strconv.ParseInt(c.Query("installation_id"), 10, 64)
 	if userID == "" || err != nil || installationID == 0 {
@@ -423,8 +421,8 @@ func (h *UserHandler) GitHubAppCallback(c *gin.Context) {
 		return
 	}
 
-	// Warm the installation token in the cache when we can. If it fails because GitHub is slow, no
-	// harm done: /repos mints one on demand. What matters is that the installation is attached.
+	// Warm the installation token in the cache when we can. If it fails (GitHub being slow) it does
+	// not matter: /repos will issue one on demand. What matters is that the installation is linked.
 	if token, terr := github.InstallationToken(h.s.cfg.GitHunAppID, h.s.cfg.GitHubAppPemPath, installationID); terr == nil {
 		_ = h.cache.SetInstallationToken(c.Request.Context(), userID, token)
 	} else {
@@ -452,8 +450,7 @@ func (h *UserHandler) getOrCreateInstallationToken(ctx context.Context, userID s
 		installationID,
 	)
 	if err != nil {
-		// the installation was deleted or revoked on GitHub, so we drop the dead id and report it as
-		// not connected
+		// the installation was deleted or revoked on GitHub → clear the dead id and treat it as "not connected"
 		if errors.Is(err, github.ErrInstallationGone) {
 			h.forgetInstallation(ctx, userID, installationID)
 			return "", ErrAppNotInstalled
@@ -468,9 +465,8 @@ func (h *UserHandler) getOrCreateInstallationToken(ctx context.Context, userID s
 	return token, nil
 }
 
-// forgetInstallation clears a dead installation, which self-heals the state when the
-// installation.deleted webhook never arrived: it removes the installation_id from the database and
-// the token from the cache.
+// forgetInstallation clears a dead installation (self healing when the installation.deleted
+// webhook never arrived): it drops installation_id from the database and the token from the cache.
 func (h *UserHandler) forgetInstallation(ctx context.Context, userID string, installationID int64) {
 	if err := h.s.ClearInstallationID(ctx, installationID); err != nil {
 		log.Printf("self-heal: clear installation %d failed: %v", installationID, err)
@@ -506,15 +502,15 @@ func (h *UserHandler) refreshInstallationToken(ctx context.Context, userID strin
 	return token, nil
 }
 
-// githubHTTP is a separate client with a hard timeout, so a call to GitHub never hangs until
-// nginx gives up after 60 seconds. A quick, clear error beats a long wait.
+// githubHTTP is a separate client with a hard timeout so a request to GitHub never hangs until the
+// nginx timeout (60s). Returning a clear error quickly is better.
 var githubHTTP = &http.Client{Timeout: 12 * time.Second}
 
 func (h *UserHandler) fetchInstallationRepos(ctx context.Context, token string) ([]byte, int, error) {
-	// an independent deadline for this request, so a browser or nginx dropping out changes nothing
+	// an independent deadline for the request: we do not depend on the browser or nginx giving up
 	rctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-	_ = ctx // kept for signature compatibility
+	_ = ctx // совместимость сигнатуры
 
 	req, err := http.NewRequestWithContext(
 		rctx,
@@ -568,8 +564,8 @@ func (h *UserHandler) GetUserRepos(c *gin.Context) {
 	body, statusCode, err := h.fetchInstallationRepos(ctx, token)
 	if err != nil {
 		log.Printf("github repos request failed: %v", err)
-		// GitHub is unreachable or timed out, which happens often from a server in Russia. We serve
-		// the last known list so a network blip does not break the dashboard.
+		// GitHub is unreachable or timing out (common from a Russian server) → serve the last known
+		// list so the dashboard does not fall over because of a network blip.
 		if cached, cErr := h.cache.GetReposCache(ctx, userID); cErr == nil && len(cached) > 0 {
 			log.Printf("repos: GitHub недоступен — отдаю кэш для %s", userID)
 			c.Data(http.StatusOK, "application/json; charset=utf-8", cached)
@@ -584,9 +580,9 @@ func (h *UserHandler) GetUserRepos(c *gin.Context) {
 	if statusCode == http.StatusUnauthorized {
 		token, err = h.refreshInstallationToken(ctx, userID)
 		if err != nil {
-			// a 401 plus a failed refresh means the app was revoked or deleted, not a server error
+			// 401 plus a failed refresh means the app was revoked or deleted, not a server error
 			log.Printf("refresh after 401 failed (treat as disconnected): %v", err)
-			c.JSON(http.StatusOK, gin.H{"connected": false, "repositories": []any{}}) // instead of a 500
+			c.JSON(http.StatusOK, gin.H{"connected": false, "repositories": []any{}}) // ← вместо 500
 			return
 		}
 
@@ -625,7 +621,7 @@ func (h *UserHandler) GetUserRepos(c *gin.Context) {
 		return
 	}
 
-	// sort by the last push, newest first, so fresh repositories are on top
+	// sort by the last push date (newest first) so fresh repositories are on top
 	sort.Slice(reposResp.Repositories, func(i, j int) bool {
 		ti := reposResp.Repositories[i].PushedAt
 		if ti == "" {
@@ -635,21 +631,21 @@ func (h *UserHandler) GetUserRepos(c *gin.Context) {
 		if tj == "" {
 			tj = reposResp.Repositories[j].UpdatedAt
 		}
-		return ti > tj // ISO-8601 strings compare lexicographically, which is chronological order
+		return ti > tj // ISO-8601 строки сравниваются лексикографически = хронологически
 	})
 
 	resp := gin.H{
 		"total_count":  reposResp.TotalCount,
 		"repositories": reposResp.Repositories,
 	}
-	// cache the successful list, to serve it if GitHub goes away for a while later
+	// cache the successful list: we will serve it if GitHub goes away for a while later
 	if data, mErr := json.Marshal(resp); mErr == nil {
 		_ = h.cache.SetReposCache(ctx, userID, data)
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// GetGitLabRepos returns the user's GitLab projects. The response is shaped like /repos,
+// GetGitLabRepos returns the user's GitLab projects. The response is shaped like /repos:
 // {connected, repositories[]}, and the frontend merges the lists itself.
 func (h *UserHandler) GetGitLabRepos(c *gin.Context) {
 	notConnected := gin.H{"connected": false, "repositories": []any{}}
@@ -669,8 +665,8 @@ func (h *UserHandler) GetGitLabRepos(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		// A refresh rejected by GitLab means the user revoked access, so we report it as not connected
-		// and they can link again. A network failure gets an honest 503 and the frontend says to retry.
+		// the refresh was rejected by GitLab (the user revoked access) → "not connected", can be linked again;
+		// a network failure → an honest 503, the frontend shows "try later"
 		if strings.Contains(err.Error(), "status 400") || strings.Contains(err.Error(), "status 401") {
 			log.Printf("gitlab token revoked for %s: %v", userID, err)
 			c.JSON(http.StatusOK, notConnected)
@@ -682,7 +678,7 @@ func (h *UserHandler) GetGitLabRepos(c *gin.Context) {
 	}
 	projects, err := gitlab.FetchProjects(ctx, h.s.cfg.GitLabBaseURL, token)
 	if errors.Is(err, gitlab.ErrUnauthorized) {
-		// the token is fresh but GitLab rejected it, so access was revoked
+		// the token is fresh but GitLab did not accept it, so access was revoked
 		c.JSON(http.StatusOK, notConnected)
 		return
 	}

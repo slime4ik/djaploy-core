@@ -9,8 +9,10 @@ import (
 	"errors"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,18 +36,23 @@ type ReferralRewarder interface {
 	RewardIfReferred(ctx context.Context, userID string)
 }
 
+// PromoExtender grants the bonus for a first successful deploy (implemented by *billing.Service).
+type PromoExtender interface {
+	ExtendMaxOnFirstDeploy(ctx context.Context, userID string) (bool, time.Time)
+}
+
 // PlanLimiter is the project limit and feature access of a plan (implemented by *billing.Service).
 type PlanLimiter interface {
-	ProjectLimit(ctx context.Context, userID string) int     // personal limit, -1 means unlimited
-	TeamProjectLimit(ctx context.Context, teamID string) int // team limit, -1 means unlimited
-	CDAllowed(ctx context.Context, userID string) bool       // personal auto deploy on push (paid plans only)
-	TeamCDAllowed(ctx context.Context, teamID string) bool   // team auto deploy on push
+	ProjectLimit(ctx context.Context, userID string) int     // личный лимит, -1 = безлимит
+	TeamProjectLimit(ctx context.Context, teamID string) int // лимит команды, -1 = безлимит
+	CDAllowed(ctx context.Context, userID string) bool       // личный авто-деплой по push (только платные)
+	TeamCDAllowed(ctx context.Context, teamID string) bool   // командный авто-деплой по push
 }
 
 // CreateRequest is what the frontend sends.
 type CreateRequest struct {
 	RepoFullName string `json:"repo_full_name"`
-	Provider     string `json:"provider"` // github (the default) | gitlab
+	Provider     string `json:"provider"` // github (по умолчанию) | gitlab
 	Domain       string `json:"domain"`
 	ServerIP     string `json:"server_ip"`
 	SSHUser      string `json:"ssh_user"`
@@ -53,38 +60,46 @@ type CreateRequest struct {
 	Env          string `json:"env"`
 
 	// what we need to know about the user's compose (all have defaults)
-	TeamID       string `json:"team_id"`      // deploy into a team, so every member sees the project
-	ProjectType  string `json:"project_type"` // web (domain plus Caddy) | worker (bot or worker, no ports)
-	Framework    string `json:"framework"`    // django | other, Django specifics are added for django only
+	TeamID       string `json:"team_id"`      // развернуть в команду (проект увидят все участники)
+	ProjectType  string `json:"project_type"` // web (домен+Caddy) | worker (бот/воркер, без портов)
+	Framework    string `json:"framework"`    // django | other — Django-специфику добавляем только для django
 	AppService   string `json:"app_service"`
 	AppPort      int    `json:"app_port"`
-	ServeStatic  *bool  `json:"serve_static"` // nil means true
-	ServeMedia   *bool  `json:"serve_media"`  // nil means true (Caddy serves /media; set false when media lives in S3)
+	ServeStatic  *bool  `json:"serve_static"` // nil → true
+	ServeMedia   *bool  `json:"serve_media"`  // nil → true (Caddy раздаёт /media; бывает медиа в S3 → false)
 	StaticVolume string `json:"static_volume"`
 	MediaVolume  string `json:"media_volume"`
 
-	// optional creation of a Django superuser
+	// SkipDjangoTasks turns migrate + collectstatic off (for people who run them in their own
+	// entrypoint, or who simply do not need them: the step is not free in time).
+	SkipDjangoTasks bool `json:"skip_django_tasks"`
+	// CheckPath is the path the uptime monitor will ping (empty = the site root).
+	CheckPath string `json:"check_path"`
+
+	// optional Django superuser creation
 	CreateSuperuser bool   `json:"create_superuser"`
 	SuUsername      string `json:"su_username"`
 	SuEmail         string `json:"su_email"`
 	SuPassword      string `json:"su_password"`
 
-	EnableCD       bool   `json:"enable_cd"`        // auto deploy on git push
-	NonRoot        bool   `json:"non_root"`         // create a separate deploy user and move off root
-	EnableVPN      bool   `json:"enable_vpn"`       // bring up our VPN (AmneziaWG) on the server
-	VPNPaths       string `json:"vpn_paths"`        // comma separated paths (/admin, /grafana) to close off to outsiders
-	AllowedIPs     string `json:"allowed_ips"`      // trusted IPs and subnets for protected paths (a VPN of their own)
-	EnableGrafana  bool   `json:"enable_grafana"`   // bring up Grafana at /grafana
-	DeployUserName string `json:"deploy_user_name"` // name of the non-root user (deploy by default)
-	SSHPubKey      string `json:"ssh_pubkey"`       // the user's public key, installed for the deploy user for direct ssh
+	EnableCD       bool   `json:"enable_cd"`        // авто-деплой на git push
+	NonRoot        bool   `json:"non_root"`         // создать отдельного пользователя deploy (уйти от root)
+	EnableVPN      bool   `json:"enable_vpn"`       // поднять наш VPN (AmneziaWG) на сервере
+	VPNPaths       string `json:"vpn_paths"`        // пути через запятую (/admin, /grafana) — закрыть для чужих
+	AllowedIPs     string `json:"allowed_ips"`      // доверенные IP/подсети к защищённым путям (свой VPN — наш не поднимаем)
+	EnableGrafana  bool   `json:"enable_grafana"`   // поднять Grafana на /grafana
+	DeployUserName string `json:"deploy_user_name"` // имя non-root пользователя (по умолчанию deploy)
+	SSHPubKey      string `json:"ssh_pubkey"`       // публичный ключ юзера → положим в deploy, чтобы заходил напрямую
 }
 
-// job is one queued task. The secrets (token, sshPassword, env, su_password) live here only and
-// never reach the database.
+// job is a queued task. Secrets (token/sshPassword/env/su_password) live here only and never reach the database.
 type job struct {
-	dep         *Deployment
-	token       string
+	dep   *Deployment
+	token string
+	// how we get into the server. accessPEM: the key the user granted themselves (the normal path).
+	// sshPassword: the fallback for those the key did not work for. Exactly one of the two.
 	sshUser     string
+	accessPEM   string
 	sshPassword string
 	env         string
 	name        string
@@ -107,7 +122,9 @@ type job struct {
 	rollback    bool
 	rollbackSHA string
 
-	isCD bool // the redeploy was triggered by auto deploy (git push), which picks the notification category
+	isCD    bool   // редеплой запущен авто-деплоем (git push) — для категории уведомления
+	pusher  string // логин того, кто запушил (CD): в ленте активности видно, чей push всё запустил
+	actorID string // кто запустил задачу (для ленты активности; пусто = автор владелец проекта)
 }
 
 // TeamAccess is team membership (implemented by *teams.Repo), used for shared project visibility.
@@ -139,19 +156,27 @@ type Service struct {
 	store    *Store
 	jobs     chan *job
 	encKey   []byte
-	limiter  PlanLimiter      // optional: project limit by plan
-	teams    TeamAccess       // optional: team membership, for shared project visibility
-	notifier Notifier         // optional: deploy notifications
-	referral ReferralRewarder // optional: referral reward on a successful deploy
+	limiter  PlanLimiter      // опционально: лимит проектов по тарифу
+	teams    TeamAccess       // опционально: членство команд (видимость общих проектов)
+	notifier Notifier         // опционально: уведомления о деплоях
+	referral ReferralRewarder // опционально: реферальная награда при успешном деплое
+	promo    PromoExtender    // опционально: +дни Max за первый успешный деплой
 
-	// serverLocks serializes WEB deploys onto one server: the shared Caddy gateway, the host ports
-	// and the caddy reload are shared resources, and two parallel deploys to one IP must not tear
-	// them apart.
+	// Soft stop: closing forbids NEW tasks, jobsWG counts the ones already running.
+	closing atomic.Bool
+	jobsWG  sync.WaitGroup
+
+	// The activity feed is written asynchronously: a single writer with a 1024 event buffer. A deploy
+	// or an http request queues an event and moves on, the insert never slows them down.
+	activity     chan activityRec
+	activityDone chan struct{}
+
+	// serverLocks serialises WEB deploys to one server: the shared Caddy gateway, host ports and
+	// caddy reload are a shared resource, two parallel deploys to one IP must not tear it apart.
 	serverLocks sync.Map // server_ip -> *sync.Mutex
 }
 
-// lockServer takes the server lock for the duration of a deploy, protecting the shared gateway
-// and ports. It returns the unlock function.
+// lockServer takes the server lock for the duration of a deploy (protects the shared gateway and ports). Returns unlock.
 func (s *Service) lockServer(ip string) func() {
 	m, _ := s.serverLocks.LoadOrStore(ip, &sync.Mutex{})
 	mu := m.(*sync.Mutex)
@@ -159,7 +184,10 @@ func (s *Service) lockServer(ip string) func() {
 	return mu.Unlock
 }
 
-// SetLimiter wires in the plan limit checks (called from main once billing exists).
+// SetPromoExtender wires up the first deploy bonus (called from main after billing).
+func (s *Service) SetPromoExtender(p PromoExtender) { s.promo = p }
+
+// SetLimiter wires up the plan limit check (called from main after billing is created).
 func (s *Service) SetLimiter(l PlanLimiter) { s.limiter = l }
 
 // SetNotifier wires in notifications (called from main once telegram exists).
@@ -168,9 +196,8 @@ func (s *Service) SetNotifier(n Notifier) { s.notifier = n }
 // SetReferral wires in referral rewards (called from main once referral exists).
 func (s *Service) SetReferral(r ReferralRewarder) { s.referral = r }
 
-// tgEsc and tgSpoiler escape text and wrap it in a spoiler for Telegram notifications
-// (parse_mode HTML). They live here so the deploy package does not have to import telegram, which
-// stays decoupled behind the Notifier interface.
+// tgEsc/tgSpoiler escape text and build spoilers for Telegram notifications (parse_mode HTML). Kept
+// local so the telegram package does not leak into deploy (decoupled through the Notifier interface).
 func tgEsc(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
@@ -254,9 +281,11 @@ func NewService(cfg *cfg.Config, resolver InstallationResolver, repo *Repo, work
 	s := &Service{
 		cfg: cfg, resolver: resolver, repo: repo,
 		store: NewStore(), jobs: make(chan *job, 64),
-		encKey: deriveKey(cfg.JWTSecret),
+		encKey:   deriveKey(cfg.JWTSecret),
+		activity: make(chan activityRec, 1024), activityDone: make(chan struct{}),
 	}
-	// the GitLab base used for cloning (gitlab.com or a self-hosted one from env)
+	go s.activityWriter()
+	// the GitLab base for cloning (gitlab.com or a self-hosted one from env)
 	if cfg.GitLabBaseURL != "" {
 		gitlabBaseURL = cfg.GitLabBaseURL
 	}
@@ -266,21 +295,23 @@ func NewService(cfg *cfg.Config, resolver InstallationResolver, repo *Repo, work
 	return s
 }
 
-// Start validates the request, mints an installation token, creates the deploy, writes it to the
-// database and puts it in the queue.
+// Start validates, mints an installation token, creates the deploy, writes it down and queues it.
 func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (*Deployment, *DeployError) {
 	if s.repo.MaintenanceOn(ctx) {
 		return nil, errMaintenance()
+	}
+	if s.stopping() {
+		return nil, derr("restarting", "Сервис сейчас обновляется.",
+			"Это занимает меньше минуты. Нажми «Развернуть» ещё раз через минуту, ничего не потеряется.")
 	}
 	dep, de := buildDeployment(userID, req)
 	if de != nil {
 		return nil, de
 	}
 
-	// Guard rail: one repository means one project per server. The directory, the containers and
-	// the gateway snippet are all named after the repo, so a second deploy of the same repo onto the
-	// same server would overwrite the first one and take a working site down. Applies to web
-	// projects and workers alike.
+	// idiot protection: one repository = one project per server. The directory, the containers and the
+	// gateway snippet are all named after the repo, so a second deploy of the same repo to the same
+	// server would overwrite the first (and take a working site down). True for web and workers alike.
 	if existing, taken := s.repo.RepoOnServer(ctx, dep.Repo, dep.ServerIP, userID, ""); taken {
 		return nil, derr("repo_on_server",
 			"Репозиторий "+dep.Repo+" уже развёрнут на этом сервере (проект «"+existing+"»).",
@@ -307,8 +338,7 @@ func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (
 		}
 	}
 
-	// Project limit: a team project counts against the TEAM limit, a personal one against the
-	// user's own plan.
+	// project limit: a team project counts against the TEAM limit, a personal one against your own plan
 	if s.limiter != nil {
 		if dep.TeamID != "" {
 			if limit := s.limiter.TeamProjectLimit(ctx, dep.TeamID); limit >= 0 {
@@ -338,8 +368,18 @@ func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (
 		}
 	}
 
-	// The demo repository is public: it clones with no token and needs no GitHub App.
-	// CD is forced off because the user cannot push to someone else's demo repo.
+	// How we get into the server. By default with the key the user granted themselves (they never tell
+	// us the password at all). The password stays as a fallback for those the key did not work for.
+	var accessPEM string
+	if strings.TrimSpace(req.SSHPassword) == "" {
+		accessPEM, de = s.accessKeyPEM(ctx, userID, dep.TeamID, dep.ServerIP, dep.SSHUser)
+		if de != nil {
+			return nil, de
+		}
+	}
+
+	// The demo repository is public: it clones without a token, no GitHub App required.
+	// CD is force disabled here: the user cannot push to someone else's demo repo.
 	if isDemoRepo(req.RepoFullName) {
 		dep.CDEnabled = false
 	}
@@ -358,7 +398,7 @@ func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (
 
 	s.store.Add(dep)
 	if err := s.repo.Create(ctx, dep); err != nil {
-		log.Printf("deploy: repo.Create failed: %v", err) // the real cause stays in the server logs
+		log.Printf("deploy: repo.Create failed: %v", err) // реальная причина — в логах сервера
 		return nil, derr("internal", "Не удалось сохранить деплой на нашей стороне.",
 			"Это проблема сервиса, не твоих данных — мы уже видим её в логах. Попробуй чуть позже.")
 	}
@@ -367,11 +407,13 @@ func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (
 	s.jobs <- &job{
 		dep:            dep,
 		token:          token,
+		actorID:        userID,
 		sshUser:        dep.SSHUser,
 		sshPassword:    req.SSHPassword,
+		accessPEM:      accessPEM,
 		env:            req.Env,
 		name:           sanitizeName(req.RepoFullName),
-		createSU:       dep.HasSuperuser, // already accounts for the framework (django only)
+		createSU:       dep.HasSuperuser, // уже с учётом фреймворка (django-only)
 		suUsername:     strings.TrimSpace(req.SuUsername),
 		suEmail:        strings.TrimSpace(req.SuEmail),
 		suPassword:     req.SuPassword,
@@ -384,8 +426,7 @@ func (s *Service) Start(ctx context.Context, userID string, req CreateRequest) (
 	return dep, nil
 }
 
-// sanitizeUser turns a name into a valid linux login (a-z0-9_-, starting with a letter).
-// Anything empty or unusable becomes "deploy".
+// sanitizeUser turns a name into a valid linux login (a-z0-9_-, starting with a letter). Empty or junk becomes "deploy".
 func sanitizeUser(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	var b strings.Builder
@@ -401,9 +442,31 @@ func sanitizeUser(s string) string {
 	return out
 }
 
+// Shutdown stops the deploy service in order: stop taking new tasks, wait for the running ones (as
+// long as ctx allows), flush the activity feed. Deploys left unfinished are marked by MarkOrphans on
+// the next start, so "running" never gets stuck in the database.
+func (s *Service) Shutdown(ctx context.Context) {
+	s.closing.Store(true)
+	done := make(chan struct{})
+	go func() {
+		s.jobsWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("deploy: активных деплоев нет, останавливаюсь")
+	case <-ctx.Done():
+		log.Println("deploy: не дождались активных деплоев, они будут помечены упавшими при старте")
+	}
+	s.CloseActivity()
+}
+
+// stopping reports that the service is shutting down and new deploys must be refused.
+func (s *Service) stopping() bool { return s.closing.Load() }
+
 func (s *Service) worker() {
 	for j := range s.jobs {
-		// Web deploys onto one server are serialized: the shared Caddy gateway and the host ports are
+		s.jobsWG.Add(1)
 		// shared resources. Workers and bots take no lock (they have no gateway) and still deploy in
 		// parallel.
 		var unlock func()
@@ -423,15 +486,45 @@ func (s *Service) worker() {
 		if unlock != nil {
 			unlock()
 		}
-		s.notifyDeploy(j) // report the result on Telegram
+		// an event for the activity feed (the by-day grid). Asynchronous, the deploy does not wait.
+		if j.dep != nil {
+			st := "ok"
+			if j.dep.Status != StatusSuccess {
+				st = "failed"
+			}
+			detail := ""
+			if rel := j.dep.ServerState.Releases; len(rel) > 0 {
+				detail = shortSHA(rel[len(rel)-1].SHA) // какой коммит уехал
+			}
+			if j.pusher != "" {
+				detail = strings.TrimSpace("push @" + j.pusher + " " + detail)
+			}
+			s.logActivity(j.dep, j.actorID, jobKind(j), st, detail)
+		}
 
-		// Referral reward: the referred user actually deployed, so both sides get Max (the referral
-		// package makes it once-only). Successful deploys only; a redeploy or rollback is fine too,
-		// since the referred user's first success still happens once.
+		s.notifyDeploy(j) // уведомить в телеграм о результате
+		s.jobsWG.Done()
+
+		// referral reward: the invited user really deployed → both get Max (once-only inside referral).
+		// Only on a successful deploy; a redeploy or a rollback is fine too (the first success of the
+		// invited user happens once either way).
 		if s.referral != nil && j.dep != nil && j.dep.Status == StatusSuccess {
 			rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
 			s.referral.RewardIfReferred(rctx, j.dep.UserID)
 			rcancel()
+		}
+
+		// First successful deploy → add a week of Max. The welcome days start ticking at signup, while the
+		// person is still buying a VPS and fixing DNS: let the week begin when they actually deployed
+		// something. Once-only per account inside.
+		if s.promo != nil && j.dep != nil && j.dep.Status == StatusSuccess {
+			pctx, pcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if granted, until := s.promo.ExtendMaxOnFirstDeploy(pctx, j.dep.UserID); granted && s.notifier != nil {
+				s.notifier.Notify(pctx, j.dep.UserID, "billing",
+					"🎁 Первый деплой прошёл, добавили неделю тарифа Макс: он у тебя до "+
+						until.Format("02.01.2006")+". Автодеплой по git push и мониторинг уже включены.")
+			}
+			pcancel()
 		}
 	}
 }
@@ -486,6 +579,10 @@ func (s *Service) Redeploy(ctx context.Context, id, userID string) (*Deployment,
 	if s.repo.MaintenanceOn(ctx) {
 		return nil, errMaintenance()
 	}
+	if s.stopping() {
+		return nil, derr("restarting", "Сервис сейчас обновляется.",
+			"Это занимает меньше минуты. Повтори обновление через минуту.")
+	}
 	dep, keyEnc, err := s.repo.getFull(ctx, id)
 	if err != nil {
 		return nil, derr("not_found", "Деплой не найден.", "")
@@ -495,7 +592,7 @@ func (s *Service) Redeploy(ctx context.Context, id, userID string) (*Deployment,
 	}
 	if keyEnc == "" {
 		return nil, derr("no_key", "Для этого проекта нет сохранённого доступа.",
-			"Запусти обычный деплой — он установит ключ, дальше обновления пойдут в один клик.")
+			"Выдай доступ к серверу на странице деплоя (одна строка в твоём терминале), и обновления снова пойдут в один клик.")
 	}
 	key, derr2 := s.decryptKey(keyEnc)
 	if derr2 != nil {
@@ -513,18 +610,17 @@ func (s *Service) Redeploy(ctx context.Context, id, userID string) (*Deployment,
 			"Дождись окончания текущего деплоя и обнови ещё раз.")
 	}
 
-	live := rerunClone(dep, redeploySteps(frameworkOrDefault(dep.ServerState.Framework) == frameworkDjango))
+	live := rerunClone(dep, redeploySteps(dep.RunsDjangoTasks()))
 	s.store.Add(live)
 	_ = s.repo.SaveState(ctx, live)
-	_ = s.repo.SetHealth(ctx, live.ID, "") // clear "down" during the rebuild, the monitor rechecks it
+	_ = s.repo.SetHealth(ctx, live.ID, "") // сбрасываем «down», пока идёт пересборка — монитор перепроверит
 	live.log("", KindStep, "Обновление в очереди…")
-	s.jobs <- &job{dep: live, token: token, redeploy: true, keyPEM: key}
+	s.jobs <- &job{dep: live, token: token, redeploy: true, keyPEM: key, actorID: userID}
 	s.logTeam(ctx, live, userID, "redeploy")
 	return live, nil
 }
 
-// Rollback takes the project back to the previous successfully deployed version, from the
-// release history.
+// Rollback returns the project to the previous successfully deployed version (from the release history).
 func (s *Service) Rollback(ctx context.Context, id, userID string) (*Deployment, *DeployError) {
 	if s.repo.MaintenanceOn(ctx) {
 		return nil, errMaintenance()
@@ -571,26 +667,26 @@ func (s *Service) Rollback(ctx context.Context, id, userID string) (*Deployment,
 	live := rerunClone(dep, rollbackSteps(dep.IsWorker()))
 	s.store.Add(live)
 	_ = s.repo.SaveState(ctx, live)
-	_ = s.repo.SetHealth(ctx, live.ID, "") // clear "down" during the rebuild, the monitor rechecks it
+	_ = s.repo.SetHealth(ctx, live.ID, "") // сбрасываем «down», пока идёт пересборка — монитор перепроверит
 	live.log("", KindStep, "Откат на предыдущую версию в очереди…")
-	s.jobs <- &job{dep: live, token: token, rollback: true, rollbackSHA: target, keyPEM: key}
+	s.jobs <- &job{dep: live, token: token, rollback: true, rollbackSHA: target, keyPEM: key, actorID: userID}
 	s.logTeam(ctx, live, userID, "rollback")
 	return live, nil
 }
 
 // RedeployForCD is the automatic update driven by a push webhook. It finds the newest deploy of
 // that repo with CD enabled and updates it. It returns (started, reason) for the webhook log.
-func (s *Service) RedeployForCD(ctx context.Context, repo, provider string) (bool, string) {
+func (s *Service) RedeployForCD(ctx context.Context, repo, provider, pusher string) (bool, string) {
 	dep, keyEnc, err := s.repo.LatestCDByRepo(ctx, repo, provider)
 	if err != nil || keyEnc == "" {
 		return false, "нет деплоя с включённым CD"
 	}
-	return s.redeployFromHook(ctx, dep, keyEnc)
+	return s.redeployFromHook(ctx, dep, keyEnc, pusher)
 }
 
 // RedeployForGitLabCD is the same for GitLab. GitLab has no HMAC signature, so we compare the
 // plain secret from X-Gitlab-Token with the project's deterministic secret.
-func (s *Service) RedeployForGitLabCD(ctx context.Context, repo, gotToken string) (bool, string) {
+func (s *Service) RedeployForGitLabCD(ctx context.Context, repo, gotToken, pusher string) (bool, string) {
 	dep, keyEnc, err := s.repo.LatestCDByRepo(ctx, repo, ProviderGitLab)
 	if err != nil || keyEnc == "" {
 		return false, "нет деплоя с включённым CD"
@@ -598,7 +694,7 @@ func (s *Service) RedeployForGitLabCD(ctx context.Context, repo, gotToken string
 	if gotToken == "" || !hmac.Equal([]byte(gotToken), []byte(s.GitLabHookSecret(dep.ID))) {
 		return false, "bad token"
 	}
-	return s.redeployFromHook(ctx, dep, keyEnc)
+	return s.redeployFromHook(ctx, dep, keyEnc, pusher)
 }
 
 // GitLabHookSecret is the project's webhook secret: a deterministic HMAC of the deploy id. It is
@@ -610,19 +706,21 @@ func (s *Service) GitLabHookSecret(depID string) string {
 }
 
 // redeployFromHook is the shared tail of the CD webhooks: plan, busy check, key, token, queue.
-func (s *Service) redeployFromHook(ctx context.Context, dep *Deployment, keyEnc string) (bool, string) {
+func (s *Service) redeployFromHook(ctx context.Context, dep *Deployment, keyEnc, pusher string) (bool, string) {
 	if s.repo.MaintenanceOn(ctx) {
 		return false, "идут технические работы — автодеплой на паузе"
 	}
-	// CD is a paid feature, so we check the CURRENT plan: a subscription may have expired while the
-	// cd_enabled flag stayed TRUE. Without this check CD would keep running after the subscription
-	// ended.
+	// CD is a paid feature. We check the CURRENT plan: a subscription could have expired while the
+	// cd_enabled flag stayed TRUE. Without this check CD would keep working after the plan ended.
 	if s.limiter != nil {
 		allowed := s.limiter.CDAllowed(ctx, dep.UserID)
 		if dep.TeamID != "" {
 			allowed = s.limiter.TeamCDAllowed(ctx, dep.TeamID)
 		}
 		if !allowed {
+			// Staying silent is not an option: the user pushed, nothing arrived, and the reason stayed in a
+			// webhook delivery log nobody reads. They will decide the breakage is on our side.
+			s.notifyCDBlocked(ctx, dep)
 			return false, "CD недоступен — подписка не активна (тариф без авто-деплоя)"
 		}
 	}
@@ -637,18 +735,39 @@ func (s *Service) redeployFromHook(ctx context.Context, dep *Deployment, keyEnc 
 	if de != nil {
 		return false, "ошибка токена git-провайдера"
 	}
-	live := rerunClone(dep, redeploySteps(frameworkOrDefault(dep.ServerState.Framework) == frameworkDjango))
+	live := rerunClone(dep, redeploySteps(dep.RunsDjangoTasks()))
 	s.store.Add(live)
 	_ = s.repo.SaveState(ctx, live)
-	_ = s.repo.SetHealth(ctx, live.ID, "") // clear "down" during the rebuild, the monitor rechecks it
+	_ = s.repo.SetHealth(ctx, live.ID, "") // сбрасываем «down», пока идёт пересборка — монитор перепроверит
 	live.log("", KindStep, "Авто-деплой по git push…")
-	s.jobs <- &job{dep: live, token: token, redeploy: true, keyPEM: key, isCD: true}
-	s.logTeam(ctx, live, "", "cd") // an empty actor means the system did it (git push)
+	// The pusher is a GitHub/GitLab login. If we know that person, the feed event goes to THEIR personal
+	// grid; if not (an outside colleague), it stays in the team feed only.
+	s.jobs <- &job{dep: live, token: token, redeploy: true, keyPEM: key, isCD: true,
+		pusher: pusher, actorID: s.repo.UserIDByLogin(ctx, pusher)}
+	s.logTeam(ctx, live, "", "cd") // actor пустой = система (git push)
 	return true, "запущен"
 }
 
-// isBusy reports whether a deploy for this id is already running, which keeps two workers out of
-// the same folder.
+// cdBlockedSaid tracks the projects we already told that auto deploy is off because of the plan.
+// The key is project + date: we remind once a day, not on every push.
+var cdBlockedSaid sync.Map // "depID|2006-01-02" -> bool
+
+// notifyCDBlocked reports that a push arrived but auto deploy did not run because of the plan.
+func (s *Service) notifyCDBlocked(ctx context.Context, dep *Deployment) {
+	if s.notifier == nil || dep == nil {
+		return
+	}
+	key := dep.ID + "|" + time.Now().UTC().Format("2006-01-02")
+	if _, said := cdBlockedSaid.LoadOrStore(key, true); said {
+		return
+	}
+	s.notifier.Notify(ctx, dep.UserID, "cd",
+		"⏸ Пришёл push в «"+tgSpoiler(projectLabel(dep))+"», но авто-деплой не сработал: "+
+			"он доступен на тарифах Про и Макс. Проект работает как работал, обновить можно "+
+			"кнопкой «Передеплоить» на дашборде.")
+}
+
+// isBusy is true when a deploy for this id is already running (guards against two workers in one folder).
 func (s *Service) isBusy(id string) bool {
 	if live := s.store.Get(id); live != nil {
 		live.mu.Lock()
@@ -695,6 +814,11 @@ func (s *Service) SetCD(ctx context.Context, id, userID string, enabled bool) er
 		action = "cd_disabled"
 		text = "⏸ Выключен авто-деплой по push: " + tgSpoiler(projectLabel(dep))
 	}
+	kind, what := "cd_on", "включён авто-деплой по push"
+	if !enabled {
+		kind, what = "cd_off", "выключен авто-деплой по push"
+	}
+	s.logActivity(dep, userID, kind, "ok", what)
 	s.logTeam(ctx, dep, userID, action)
 	s.notifyTeamChange(ctx, dep, userID, text)
 	return nil
@@ -736,14 +860,13 @@ func rerunClone(src *Deployment, steps []StepState) *Deployment {
 		AppService: src.AppService, AppPort: src.AppPort, ServeStatic: src.ServeStatic, ServeMedia: src.ServeMedia,
 		StaticVolume: src.StaticVolume, MediaVolume: src.MediaVolume, HasSuperuser: src.HasSuperuser,
 		SSHUser: src.SSHUser, CDEnabled: src.CDEnabled,
-		ServerState: src.ServerState, // CRITICAL: without it a redeploy or CD wipes vpn, deploy_user and paths
+		ServerState: src.ServerState, // КРИТично: иначе редеплой/CD затирают vpn/deploy_user/пути
 		Status:      StatusQueued, Steps: steps, CreatedAt: src.CreatedAt,
 		subs: map[chan LogLine]struct{}{}, sshKeyEnc: src.sshKeyEnc,
 	}
 }
 
-// Find returns the live deploy from memory, or the stored one from the database. Access is
-// granted to the owner OR a member of the project's team.
+// Find returns the live deploy from memory, otherwise from the database. Access: the owner OR a member of the project's team.
 func (s *Service) Find(ctx context.Context, id, userID string) (*Deployment, error) {
 	if dep := s.store.Get(id); dep != nil {
 		if !s.canAccess(ctx, dep, userID) {
@@ -813,9 +936,8 @@ func (s *Service) AppLogs(ctx context.Context, id, userID string) (string, *Depl
 	return b.String(), nil
 }
 
-// VPNConfig reads the client WireGuard config off the user's server. It is NOT in our database:
-// the secret lives on the user's server only. The user downloads the .conf and imports it into
-// WireGuard.
+// VPNConfig returns the client WireGuard config from the user's server (NOT from our database: the
+// secret lives only on their server). The user downloads the .conf and imports it into WireGuard.
 func (s *Service) VPNConfig(ctx context.Context, id, userID string) (string, *DeployError) {
 	dep, keyEnc, err := s.repo.getFull(ctx, id)
 	if err != nil {
@@ -860,9 +982,8 @@ func (s *Service) VPNConfig(ctx context.Context, id, userID string) (string, *De
 	return strings.TrimSpace(b.String()), nil
 }
 
-// Delete removes a project. Modes: unlink (from the dashboard only), teardown (plus docker
-// compose down, with data and volumes kept), purge (plus down -v and rm -rf of the folder, a FULL
-// cleanup of the server).
+// Delete removes a project. Modes: unlink (from the dashboard only), teardown (+ docker compose down,
+// data and volumes stay), purge (+ down -v and rm -rf of the folder, a FULL cleanup of the server).
 func (s *Service) Delete(ctx context.Context, id, userID string, teardown, purge bool) *DeployError {
 	dep, keyEnc, err := s.repo.getFull(ctx, id)
 	if err != nil {
@@ -871,12 +992,12 @@ func (s *Service) Delete(ctx context.Context, id, userID string, teardown, purge
 	if !s.canAccess(ctx, dep, userID) {
 		return derr("forbidden", "Нет доступа к этому проекту.", "")
 	}
-	// The server side of the deletion is NOT tied to the request ctx. The frontend removes the
-	// project optimistically and may time out while the SSH cleanup runs (purge does down -v --rmi
-	// local and tears the VPN down, which takes seconds). Otherwise a cancelled ctx would abort
-	// repo.Delete, the row would survive and the user would have to delete twice.
+	// The server side of deletion is NOT tied to the request ctx: the frontend removes the project
+	// optimistically and may time out while the SSH cleanup runs (purge: down -v --rmi local, tearing the
+	// VPN down, that is seconds). Otherwise a cancelled ctx kills repo.Delete, the row survives and the user is told to "delete it a second time".
 	opCtx, opCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer opCancel()
+	dropAccessKey := false // сняли с сервера выданный ключ доступа → забыть и у себя
 	if (teardown || purge) && keyEnc != "" {
 		if key, de := s.decryptKey(keyEnc); de == nil {
 			// The host key is verified here too, but a deletion is never blocked by it: if the
@@ -884,7 +1005,7 @@ func (s *Service) Delete(ctx context.Context, id, userID string, teardown, purge
 			// to be able to drop the row (otherwise the project becomes undeletable).
 			sshc, hkErr, e := dialKeyPinned(opCtx, s.repo, dep.UserID, dep.ServerIP, dep.SSHUser, key)
 			if hkErr != nil {
-				log.Printf("deploy: delete %s: skipping cleanup on the server, %s", id, hkErr.Message)
+				log.Printf("deploy: delete %s: пропускаю уборку на сервере, %s", id, hkErr.Message)
 			}
 			if e == nil {
 				dir := "/opt/djaploy/" + sanitizeName(dep.Repo)
@@ -906,19 +1027,34 @@ func (s *Service) Delete(ctx context.Context, id, userID string, teardown, purge
 							// the port may have been picked automatically (51820..51830), so clean the range
 							`; for pp in $(seq 51820 51830); do $SUDO iptables -D INPUT -p udp --dport $pp -j ACCEPT 2>/dev/null; $SUDO ufw delete allow $pp/udp 2>/dev/null; done || true`
 					}
-					// remove our access key from authorized_keys, as if we were never here
+					// We take our access key out of authorized_keys, "as if we were never here".
+					// But when it is the SERVER key the user granted and other projects of theirs are
+					// still on that server, the line stays: it is shared, and revoking it is its own button.
 					if line, perr := pubLineFromPriv(key); perr == nil {
-						ak := "$HOME/.ssh/authorized_keys"
-						cmd += "; grep -vF " + sq(line) + " " + ak + " > " + ak + ".djtmp 2>/dev/null && mv " + ak + ".djtmp " + ak + " || true"
+						others := s.repo.CountDeploymentsOn(opCtx, dep.UserID, dep.ServerIP, id)
+						granted, _ := s.repo.AccessKey(opCtx, dep.UserID, dep.ServerIP, dep.SSHUser)
+						shared := granted != nil && strings.HasPrefix(granted.PubLine, line)
+						if shared && others > 0 {
+							log.Printf("deploy: delete %s: ключ доступа общий для сервера, оставляю (проектов ещё %d)", id, others)
+						} else {
+							// The same command we show the user for a manual revoke. `grep -v ... && mv`
+							// will not do: if our line is the only one in the file, grep returns 1, the
+							// chain breaks and the key stays on the server.
+							label := ""
+							if shared {
+								label = granted.Label
+							}
+							cmd += "; " + revokeOnServer(line, label) + " 2>/dev/null || true"
+							dropAccessKey = shared
+						}
 					}
 				} else {
 					// down without -v stops the containers and keeps the volumes and the database
 					cmd = base + "down --remove-orphans 2>&1 || true"
 				}
-				// Take the site out of the shared Caddy gateway while the OTHER sites keep working. If
-				// this was the LAST site we shut the gateway down entirely, because a reload on an empty
-				// config fails and the deleted site would hang around until a restart. Workers have no
-				// snippet.
+				// take the site off the shared Caddy gateway, the OTHER sites keep working ("as if it was never
+				// here"). If this was the LAST site we shut the gateway down completely (otherwise a reload on an
+				// empty config fails and the deleted site would hang around until a restart). Workers have no snippet.
 				if !dep.IsWorker() {
 					name := sanitizeName(dep.Repo)
 					gw := "/opt/djaploy/_gateway"
@@ -945,16 +1081,26 @@ func (s *Service) Delete(ctx context.Context, id, userID string, teardown, purge
 	s.store.Remove(id)
 
 	action, text := "unlinked", "📤 Проект «"+tgSpoiler(projectLabel(dep))+"» отвязан от djaploy (сервер не тронут)"
+	what := "проект отвязан, сервер не тронут"
 	switch {
 	case purge:
 		action, text = "purged", "🗑 Проект «"+tgSpoiler(projectLabel(dep))+"» полностью удалён с сервера (включая данные)"
+		what = "проект удалён с сервера вместе с данными"
 	case teardown:
 		action, text = "stopped", "⏹ Проект «"+tgSpoiler(projectLabel(dep))+"» остановлен на сервере (данные целы)"
+		what = "проект остановлен, данные целы"
 	}
-	// The user's last project on this server is gone, so the fingerprint goes with it. Otherwise a
-	// rebuilt server would hit a mismatch with no server card left in the dashboard to reset from.
+	s.logActivity(dep, userID, "delete", "ok", what)
+	// The user's last project on this server is gone, so we forget the fingerprint too. Otherwise, after
+	// rebuilding the server, they would hit a mismatch while the server card that resets it is no longer
+	// in the dashboard.
 	if !s.repo.HasDeploymentsOn(opCtx, dep.UserID, dep.ServerIP) {
 		_ = s.repo.ForgetHostPin(opCtx, dep.UserID, dep.ServerIP)
+	}
+	// The granted key came off the server along with the last project, so we drop our half as well and
+	// the access list stops showing a key that can no longer get in.
+	if dropAccessKey {
+		_ = s.repo.DeleteAccessKey(opCtx, dep.UserID, dep.ServerIP, dep.SSHUser)
 	}
 
 	s.logTeam(opCtx, dep, userID, action)
@@ -976,7 +1122,7 @@ func (s *Service) ResetHostKey(ctx context.Context, userID, ip string) *DeployEr
 		log.Printf("deploy: reset host key %s: %v", ip, err)
 		return derr("internal", "Не удалось сбросить отпечаток сервера.", "Попробуй ещё раз.")
 	}
-	hostKeyAlerted.Delete(ip) // background alerts for this server are allowed again
+	hostKeyAlerted.Delete(ip) // фоновые алерты по этому серверу снова разрешены
 	if s.notifier != nil {
 		s.notifier.Notify(ctx, userID, "deploys",
 			"🔑 Отпечаток сервера "+tgSpoiler(ip)+" сброшен. При следующем подключении запомним новый ключ.")
@@ -1002,17 +1148,14 @@ func buildDeployment(userID string, r CreateRequest) (*Deployment, *DeployError)
 		return nil, derr("bad_input", "IP сервера некорректен: "+r.ServerIP,
 			"Укажи IP-адрес твоего сервера, например 203.0.113.10.")
 	}
-	// SSRF protection: a deploy must not target internal or service addresses (loopback, private
-	// networks, link-local and the cloud metadata range 169.254.0.0/16). A user's server is always
-	// publicly reachable.
+	// SSRF guard: no deploys to internal or service addresses (loopback, private networks, link-local and
+	// the cloud metadata range 169.254.0.0/16). A user's server is always public.
 	if !isPublicIP(parsedIP) {
 		return nil, derr("bad_input", "Этот IP не похож на публичный адрес сервера: "+r.ServerIP,
 			"Укажи внешний (публичный) IP твоего VPS — приватные и служебные адреса недопустимы.")
 	}
-	if strings.TrimSpace(r.SSHPassword) == "" {
-		return nil, derr("bad_input", "Не указан пароль для SSH.",
-			"Введи пароль от root-доступа к серверу (тот, которым заходишь по ssh root@IP).")
-	}
+	// The password is optional: the normal path is the key the user granted themselves (see access.go).
+	// Whether access exists is checked by Start, which has a ctx and the repository.
 	framework := frameworkOrDefault(strings.TrimSpace(r.Framework))
 	// a Django superuser only makes sense for Django, so any other stack ignores it
 	createSU := r.CreateSuperuser && framework == frameworkDjango
@@ -1024,9 +1167,20 @@ func buildDeployment(userID string, r CreateRequest) (*Deployment, *DeployError)
 		}
 	}
 
+	checkPath, cpErr := normalizeCheckPath(r.CheckPath)
+	if cpErr != nil {
+		return nil, cpErr
+	}
+
+	// The service and volume names go into our docker-compose.caddy.yml. Junk (a newline, a colon) would
+	// break the YAML and the user would get a cryptic docker error instead of a hint.
 	service := strings.TrimSpace(r.AppService)
 	if service == "" {
 		service = "web"
+	}
+	if !composeNameRe.MatchString(service) {
+		return nil, derr("bad_input", "Имя сервиса в compose выглядит странно: "+service,
+			"Обычно это web или app. Допустимы латиница, цифры, точка, дефис и подчёркивание.")
 	}
 	port := r.AppPort
 	if port <= 0 || port > 65535 {
@@ -1038,9 +1192,17 @@ func buildDeployment(userID string, r CreateRequest) (*Deployment, *DeployError)
 	if staticVol == "" {
 		staticVol = "static_volume"
 	}
+	if !composeNameRe.MatchString(staticVol) {
+		return nil, derr("bad_input", "Имя тома статики выглядит странно: "+staticVol,
+			"Допустимы латиница, цифры, точка, дефис и подчёркивание.")
+	}
 	mediaVol := strings.TrimSpace(r.MediaVolume)
 	if mediaVol == "" {
 		mediaVol = "media_volume"
+	}
+	if !composeNameRe.MatchString(mediaVol) {
+		return nil, derr("bad_input", "Имя тома медиа выглядит странно: "+mediaVol,
+			"Допустимы латиница, цифры, точка, дефис и подчёркивание.")
 	}
 	sshUser := strings.TrimSpace(r.SSHUser)
 	if sshUser == "" {
@@ -1065,14 +1227,16 @@ func buildDeployment(userID string, r CreateRequest) (*Deployment, *DeployError)
 		SSHUser:      sshUser,
 		CDEnabled:    r.EnableCD,
 		ServerState: ServerState{
-			ProjectType: projectType(worker),
-			Framework:   framework,
-			VPNPaths:    protectedPaths(r),
-			AllowedIPs:  parseIPs(r.AllowedIPs),
-			Grafana:     r.EnableGrafana && !worker, // Grafana hangs off Caddy, so it is web only
+			ProjectType:     projectType(worker),
+			Framework:       framework,
+			VPNPaths:        protectedPaths(r),
+			AllowedIPs:      parseIPs(r.AllowedIPs),
+			Grafana:         r.EnableGrafana && !worker, // Grafana вешается на Caddy → только для web
+			CheckPath:       checkPath,
+			SkipDjangoTasks: r.SkipDjangoTasks,
 		},
 		Status:    StatusQueued,
-		Steps:     defaultSteps(createSU, r.EnableVPN, r.NonRoot, worker, framework == frameworkDjango),
+		Steps:     defaultSteps(createSU, r.EnableVPN, r.NonRoot, worker, framework == frameworkDjango && !r.SkipDjangoTasks),
 		CreatedAt: time.Now(),
 		subs:      map[chan LogLine]struct{}{},
 	}, nil
@@ -1086,8 +1250,7 @@ func projectType(worker bool) string {
 	return "web"
 }
 
-// protectedPaths: paths only make sense when there is something to guard them with, either our
-// VPN or the user's own IPs.
+// protectedPaths: paths only make sense when there is something to protect them with, our VPN or the user's own IPs.
 func protectedPaths(r CreateRequest) []string {
 	if !r.EnableVPN && strings.TrimSpace(r.AllowedIPs) == "" {
 		return nil
@@ -1095,8 +1258,7 @@ func protectedPaths(r CreateRequest) []string {
 	return parsePathsStr(r.VPNPaths)
 }
 
-// parseIPs validates a comma separated list of IPs and CIDRs and returns a normalized list,
-// dropping anything unusable.
+// parseIPs validates a comma separated IP/CIDR list into a normalized one (junk is dropped).
 func parseIPs(s string) []string {
 	var out []string
 	for _, p := range strings.FieldsFunc(s, func(c rune) bool { return c == ',' || c == ' ' || c == '\n' }) {
@@ -1120,7 +1282,29 @@ func parseIPs(s string) []string {
 	return out
 }
 
-// parsePathsStr turns "/admin, /grafana" into ["/admin","/grafana"], always with a leading slash.
+// parsePathsStr: "/admin, /grafana" → ["/admin","/grafana"] (a leading slash is guaranteed).
+var composeNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+
+var pathRe = regexp.MustCompile(`^/[A-Za-z0-9._~/-]{0,200}$`)
+
+// normalizeCheckPath is the path the uptime monitor will hit. Empty = the site root.
+// Same filter as the protected paths: the monitor URL is built by concatenation, and junk like a space
+// or a quote has no business being in it.
+func normalizeCheckPath(s string) (string, *DeployError) {
+	p := strings.TrimSpace(s)
+	if p == "" || p == "/" {
+		return "", nil
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if !pathRe.MatchString(p) {
+		return "", derr("bad_input", "Путь для проверки выглядит странно: "+p,
+			"Начни со слэша, например /healthz. Допустимы латиница, цифры, точка, дефис, подчёркивание и слэш.")
+	}
+	return p, nil
+}
+
 func parsePathsStr(s string) []string {
 	var out []string
 	for _, p := range strings.FieldsFunc(s, func(c rune) bool { return c == ',' || c == ' ' || c == '\n' }) {
@@ -1130,6 +1314,11 @@ func parsePathsStr(s string) []string {
 		}
 		if !strings.HasPrefix(p, "/") {
 			p = "/" + p
+		}
+		// The path goes into the shared gateway config. A brace or a quote breaks that config, and on the
+		// next restart Caddy will not come up, taking every site on the server down. Only safe input passes.
+		if !pathRe.MatchString(p) {
+			continue
 		}
 		out = append(out, p)
 	}
@@ -1181,9 +1370,8 @@ func (s *Service) RenameServer(ctx context.Context, userID, ip, name string) *De
 }
 
 // UpdateProtection changes the protected paths AND the trusted IP list of a running project.
-// It works both with our VPN and with a VPN of the user's own (protection by IP alone). It
-// rewrites the Caddy config, adjusts the client between split and full tunnel when our VPN is in
-// use, and reloads Caddy gracefully.
+// Works both with our VPN and with a "bring your own VPN" setup (IP protection only). It updates the
+// Caddyfile, adjusts split/full tunnel for our VPN client and reloads Caddy gracefully.
 func (s *Service) UpdateProtection(ctx context.Context, id, userID, pathsStr, ipsStr string) (*DeploymentView, *DeployError) {
 	dep, keyEnc, err := s.repo.getFull(ctx, id)
 	if err != nil {
@@ -1191,6 +1379,12 @@ func (s *Service) UpdateProtection(ctx context.Context, id, userID, pathsStr, ip
 	}
 	if !s.canAccess(ctx, dep, userID) {
 		return nil, derr("forbidden", "Нет доступа.", "")
+	}
+	// While the project is being deployed we change nothing on the server: the deploy itself is writing
+	// .env, the gateway config and rebuilding containers. Two hands in one folder produce garbage.
+	if s.isBusy(id) {
+		return nil, derr("busy", "Проект сейчас разворачивается.",
+			"Дождись конца деплоя и повтори — иначе изменения перетрутся тем, что пишет деплой.")
 	}
 	if keyEnc == "" {
 		return nil, derr("no_key", "Нет доступа к серверу.", "Разверни проект заново.")
@@ -1231,6 +1425,7 @@ func (s *Service) UpdateProtection(ctx context.Context, id, userID, pathsStr, ip
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	_ = sshc.Run(cctx, cmd, func(string) {})
 	cancel()
+	s.logActivity(dep, userID, "protection", "ok", "изменены защищённые пути или доверенные IP")
 
 	_ = s.repo.SaveState(ctx, dep)
 	if live := s.store.Get(id); live != nil {
@@ -1245,8 +1440,45 @@ func (s *Service) UpdateProtection(ctx context.Context, id, userID, pathsStr, ip
 	return &v, nil
 }
 
-// SetProjectTeam hands an existing project to a team, or makes it personal again with an empty
-// teamID. Only the owner of the row may do it, and to hand it to a team they must be a member.
+// UpdateSettings changes the project settings that live only on our side and never touch the server:
+// the uptime check path and the Django tasks switch. That is why there is no ssh and no config reload
+// here: the path is picked up by the next monitor tick, the flag by the next deploy.
+func (s *Service) UpdateSettings(ctx context.Context, id, userID, checkPath string, skipDjango bool) (*DeploymentView, *DeployError) {
+	dep, _, err := s.repo.getFull(ctx, id)
+	if err != nil {
+		return nil, derr("not_found", "Проект не найден.", "")
+	}
+	if !s.canAccess(ctx, dep, userID) {
+		return nil, derr("forbidden", "Нет доступа.", "")
+	}
+	// A running deploy is building its own step list and writing state, so stay out of its way.
+	if s.isBusy(id) {
+		return nil, derr("busy", "Проект сейчас разворачивается.",
+			"Дождись конца деплоя и повтори.")
+	}
+	path, cpErr := normalizeCheckPath(checkPath)
+	if cpErr != nil {
+		return nil, cpErr
+	}
+	dep.ServerState.CheckPath = path
+	dep.ServerState.SkipDjangoTasks = skipDjango
+
+	if err := s.repo.SaveState(ctx, dep); err != nil {
+		return nil, derr("update_failed", "Не удалось сохранить настройки.", "Попробуй ещё раз.")
+	}
+	if live := s.store.Get(id); live != nil {
+		live.markState(func(st *ServerState) {
+			st.CheckPath = path
+			st.SkipDjangoTasks = skipDjango
+		})
+	}
+	s.logActivity(dep, userID, "settings", "ok", "изменены настройки проекта")
+	v := dep.View()
+	return &v, nil
+}
+
+// SetProjectTeam hands an existing project to a team (or back to personal, teamID="").
+// Owner of the record only; when handing it to a team they must be a member of it.
 func (s *Service) SetProjectTeam(ctx context.Context, id, userID, teamID string) (*DeploymentView, *DeployError) {
 	dep, _, err := s.repo.getFull(ctx, id)
 	if err != nil {
@@ -1309,6 +1541,12 @@ func (s *Service) UpdateEnv(ctx context.Context, id, userID, env string) (*Deplo
 	if !s.canAccess(ctx, dep, userID) {
 		return nil, derr("forbidden", "Нет доступа.", "")
 	}
+	// While the project is being deployed we change nothing on the server: the deploy itself is writing
+	// .env, the gateway config and rebuilding containers. Two hands in one folder produce garbage.
+	if s.isBusy(id) {
+		return nil, derr("busy", "Проект сейчас разворачивается.",
+			"Дождись конца деплоя и повтори — иначе изменения перетрутся тем, что пишет деплой.")
+	}
 	if keyEnc == "" {
 		return nil, derr("no_key", "Нет доступа к серверу.", "Разверни проект заново.")
 	}
@@ -1346,7 +1584,69 @@ func (s *Service) UpdateEnv(ctx context.Context, id, userID, env string) (*Deplo
 	_ = sshc.Run(cctx, cmd, func(string) {})
 	cancel()
 
+	// Check the application really came up with the new .env. We used to report "done" no matter what:
+	// the container could die right after start (a common cause is changing POSTGRES_* when the database
+	// already exists with the old password), the site went down, and the user heard about it from
+	// monitoring minutes later without connecting it to the .env edit.
+	check := "cd " + sq(dir) + " && cid=$(docker compose " + files + " ps -q " + sq(dep.AppService) + " 2>/dev/null | head -1); " +
+		"if [ -z \"$cid\" ]; then echo dj_state=missing; else " +
+		"echo dj_state=$(docker inspect -f '{{.State.Status}}' \"$cid\" 2>/dev/null); " +
+		"docker logs --tail 25 \"$cid\" 2>&1 | tail -25; fi"
+	out := sshCapture(sshc, check)
+
+	// Recreating a container cuts its link to the gateway: the app-<project> alias in the shared network
+	// is attached by a separate command during a deploy, not described in compose. The .env update did
+	// not know that, so the application was alive inside and answered /healthz while the site was dead
+	// from outside until the user pressed "Redeploy". We attach it back and reload Caddy.
+	d := &Deployer{ssh: sshc, dep: dep, repo: s.repo, dir: dir}
+	if !dep.IsWorker() && strings.Contains(out, "dj_state=running") {
+		gctx, gcancel := context.WithTimeout(ctx, 2*time.Minute)
+		if de := d.connectGateway(gctx); de != nil {
+			gcancel()
+			s.logActivity(dep, userID, "env", "failed", "не удалось вернуть проект в шлюз")
+			return nil, derr("env_gateway",
+				"Записал .env и перезапустил контейнеры, но не смог вернуть проект в общий шлюз.",
+				"Сайт сейчас может не отвечать снаружи. Нажми «Передеплоить»: полный деплой поднимает связь со шлюзом заново.")
+		}
+		gcancel()
+	}
+
+	if !strings.Contains(out, "dj_state=running") {
+		s.logActivity(dep, userID, "env", "failed", "приложение не поднялось с новым .env")
+		s.notifyTeamChange(ctx, dep, userID,
+			"⚠️ .env проекта «"+tgSpoiler(projectLabel(dep))+"» сохранён, но приложение с ним не поднялось")
+		if s.notifier != nil {
+			s.notifier.Notify(ctx, dep.UserID, "deploys",
+				"⚠️ Сохранил новый .env для «"+tgSpoiler(projectLabel(dep))+"», но приложение не поднялось. Сайт сейчас лежит. Открой проект и посмотри логи приложения.")
+		}
+		return nil, derr("env_broke",
+			"Записал .env на сервер, но приложение с ним не поднялось. Сайт сейчас недоступен.",
+			"Частые причины: поменяли POSTGRES_* (база уже создана со старым паролем и новый не подойдёт), "+
+				"опечатка в значении, кавычки или перенос строки внутри значения. Верни прежние значения и сохрани ещё раз.\n\n"+
+				"Последние строки лога контейнера:\n"+trim(out))
+	}
+
+	// Final check: the site must answer over HTTPS from outside. A "running" container and a healthy
+	// /healthz inside mean nothing yet: the shared Caddy stands between them and the user.
+	if !dep.IsWorker() {
+		hctx, hcancel := context.WithTimeout(ctx, 70*time.Second)
+		hde := d.health(hctx)
+		hcancel()
+		if hde != nil {
+			s.logActivity(dep, userID, "env", "failed", "сайт не ответил после смены .env")
+			if s.notifier != nil {
+				s.notifier.Notify(ctx, dep.UserID, "deploys",
+					"⚠️ Обновил .env для «"+tgSpoiler(projectLabel(dep))+"», контейнеры поднялись, но сайт снаружи не ответил. Загляни в проект.")
+			}
+			return nil, derr("env_unreachable",
+				"Записал .env и перезапустил контейнеры, но сайт снаружи так и не ответил.",
+				"Контейнер запущен, значит дело не в самом приложении. Посмотри «Логи приложения», "+
+					"а если там всё чисто — нажми «Передеплоить», он пересобирает связь с общим Caddy.")
+		}
+	}
+
 	s.logTeam(ctx, dep, userID, "env_updated")
+	s.logActivity(dep, userID, "env", "ok", "контейнеры перезапущены")
 	s.notifyTeamChange(ctx, dep, userID, "🔑 Обновлён .env проекта «"+tgSpoiler(projectLabel(dep))+"» — контейнеры перезапущены")
 
 	v := dep.View()
@@ -1363,13 +1663,20 @@ func isPublicIP(ip net.IP) bool {
 	return true
 }
 
+// looksLikeDomain is a strict domain check. Strict not out of pedantry: the domain goes into the config
+// of the SHARED Caddy gateway that hosts every site on the server. A comma there means "one more domain
+// for this same site" (a way to hijack someone else's domain on a shared team server), and a brace or a
+// quote breaks the whole config, so the next gateway restart takes ALL the sites down.
 func looksLikeDomain(d string) bool {
 	d = strings.TrimSpace(d)
-	if d == "" || strings.ContainsAny(d, " /:\\") || !strings.Contains(d, ".") {
+	if len(d) < 4 || len(d) > 253 || !strings.Contains(d, ".") {
 		return false
 	}
-	return true
+	return domainRe.MatchString(d)
 }
+
+// labels of letters/digits/dashes, a dot between them, a zone of two letters or more
+var domainRe = regexp.MustCompile(`^(?i:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?i:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*\.(?i:[a-z]{2,63})$`)
 
 func sanitizeName(full string) string {
 	name := full

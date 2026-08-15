@@ -1,6 +1,5 @@
-// Package ratelimit is a small thread safe rate limiter used as flood protection.
-// It is a fixed window kept in memory, which is reliable on a single instance and pulls in no
-// dependencies.
+// Package ratelimit is a small thread safe rate limiter (flood protection).
+// A fixed window in memory: reliable on a single instance and without dependencies.
 package ratelimit
 
 import (
@@ -24,9 +23,8 @@ func New() *Limiter {
 	return l
 }
 
-// Allow reports whether the action fits the limit (max per window, for this key).
-// Once the limit is exceeded it returns false and the caller rejects the action, for example with
-// HTTP 429.
+// Allow returns true when the action is within the limit (max per period for this key).
+// Over the limit it returns false (the action must be refused, for example with HTTP 429).
 func (l *Limiter) Allow(key string, max int, per time.Duration) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -43,7 +41,7 @@ func (l *Limiter) Allow(key string, max int, per time.Duration) bool {
 	return true
 }
 
-// cleanup drops expired windows every 10 minutes so the map does not grow forever.
+// cleanup drops stale windows every 10 minutes so the map does not grow forever.
 func (l *Limiter) cleanup() {
 	for range time.Tick(10 * time.Minute) {
 		l.mu.Lock()

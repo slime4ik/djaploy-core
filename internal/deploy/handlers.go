@@ -6,20 +6,46 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/slime4ik/djaploy-core/internal/ratelimit"
 )
 
-type Handler struct{ svc *Service }
+type Handler struct {
+	svc *Service
+	// Anti-abuse on the expensive endpoints. Deploy and access check open SSH to ANY public IP the
+	// user names. Without a limit the service becomes a convenient password bruteforcer and port
+	// scanner driven by someone else's hands (the fallback password path allows exactly that).
+	rl *ratelimit.Limiter
+}
 
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+func NewHandler(svc *Service) *Handler { return &Handler{svc: svc, rl: ratelimit.New()} }
 
-// POST /api/v1/deploy starts a deploy. It answers 202 with a DeploymentView (including the id),
-// after which the frontend listens to the log stream.
+// tooOften is the shared 429 reply. The key must include the user so one cannot block everyone.
+func (h *Handler) tooOften(c *gin.Context, key string, max int, per time.Duration) bool {
+	if h.rl == nil || h.rl.Allow(key, max, per) {
+		return false
+	}
+	c.JSON(http.StatusTooManyRequests, gin.H{"error": &DeployError{
+		Code:    "too_often",
+		Message: "Слишком много попыток подряд.",
+		Hint:    "Подожди пару минут и повтори. Если упёрся в это на обычной работе, напиши нам.",
+	}})
+	return true
+}
+
+// POST /api/v1/deploy starts a deploy. 202 + DeploymentView (with id), then the frontend tails the log.
 func (h *Handler) Create(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "не авторизован"})
+		return
+	}
+	// 10 deploy starts per 10 minutes per user: never in the way of normal work, and it makes guessing
+	// passwords for other people's servers through our infrastructure pointless.
+	if h.tooOften(c, "deploy:"+userID, 10, 10*time.Minute) {
 		return
 	}
 	var req CreateRequest
@@ -31,7 +57,7 @@ func (h *Handler) Create(c *gin.Context) {
 	}
 	dep, de := h.svc.Start(c.Request.Context(), userID, req)
 	if de != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": de}) // structured error with a hint
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": de}) // структурная ошибка с подсказкой
 		return
 	}
 	c.JSON(http.StatusAccepted, dep.View())
@@ -65,6 +91,8 @@ func (h *Handler) Rollback(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -83,6 +111,8 @@ func (h *Handler) ServerStats(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -172,6 +202,8 @@ func (h *Handler) Delete(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict // идёт деплой: фронт вернёт проект в список и покажет подсказку
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -179,7 +211,35 @@ func (h *Handler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "deleted", "teardown": teardown})
 }
 
-// PATCH /api/v1/deploy/:id/protection changes the protected paths and the list of trusted IPs.
+// PATCH /api/v1/deploy/:id/settings sets the uptime check path and the Django tasks switch.
+func (h *Handler) UpdateSettings(c *gin.Context) {
+	userID := c.GetString("user_id")
+	var body struct {
+		CheckPath       string `json:"check_path"`
+		SkipDjangoTasks bool   `json:"skip_django_tasks"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad body"})
+		return
+	}
+	view, de := h.svc.UpdateSettings(c.Request.Context(), c.Param("id"), userID, body.CheckPath, body.SkipDjangoTasks)
+	if de != nil {
+		code := http.StatusUnprocessableEntity
+		switch de.Code {
+		case "forbidden":
+			code = http.StatusForbidden
+		case "not_found":
+			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
+		}
+		c.JSON(code, gin.H{"error": de})
+		return
+	}
+	c.JSON(http.StatusOK, view)
+}
+
+// PATCH /api/v1/deploy/:id/protection changes the protected paths and the trusted IP list.
 func (h *Handler) UpdateVPNPaths(c *gin.Context) {
 	userID := c.GetString("user_id")
 	var body struct {
@@ -198,6 +258,8 @@ func (h *Handler) UpdateVPNPaths(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -223,6 +285,8 @@ func (h *Handler) SetProjectTeam(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -280,7 +344,99 @@ func (h *Handler) ResetHostKey(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// PUT /api/v1/deploy/:id/env rewrites the .env of a running project and restarts the containers.
+// ── server access (the user grants it themselves, we never ask for a password) ──
+
+// accessTarget reads the ssh user from the request body (empty = root).
+func accessTarget(c *gin.Context) string {
+	var body struct {
+		SSHUser string `json:"ssh_user"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	return body.SSHUser
+}
+
+// POST /api/v1/servers/:ip/access issues an access key (or shows the one already issued):
+// the authorized_keys line plus ready-made "add" and "revoke" commands.
+func (h *Handler) EnsureAccess(c *gin.Context) {
+	view, de := h.svc.EnsureAccess(c.Request.Context(), c.GetString("user_id"), c.Param("ip"), accessTarget(c))
+	if de != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": de})
+		return
+	}
+	c.JSON(http.StatusOK, view)
+}
+
+// POST /api/v1/servers/:ip/access/check answers "did you add the line?" by trying the key.
+func (h *Handler) CheckAccess(c *gin.Context) {
+	// an access check is an ssh connect to the given IP, so it is rate limited too
+	if h.tooOften(c, "access:"+c.GetString("user_id"), 30, 10*time.Minute) {
+		return
+	}
+	res, de := h.svc.CheckAccess(c.Request.Context(), c.GetString("user_id"), c.Param("ip"), accessTarget(c))
+	if de != nil {
+		// "not letting us in yet" is a normal waiting answer, not a failure. 409 so the frontend
+		// can tell it apart from input errors and just show a hint next to the button.
+		code := http.StatusUnprocessableEntity
+		if de.Code == "access_not_ready" {
+			code = http.StatusConflict
+		}
+		c.JSON(code, gin.H{"error": de})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// DELETE /api/v1/servers/:ip/access?ssh_user=root&force=1 revokes access.
+func (h *Handler) RevokeAccess(c *gin.Context) {
+	res, de := h.svc.RevokeAccess(c.Request.Context(), c.GetString("user_id"), c.Param("ip"),
+		c.Query("ssh_user"), c.Query("force") == "1")
+	if de != nil {
+		code := http.StatusUnprocessableEntity
+		switch de.Code {
+		case "not_found":
+			code = http.StatusNotFound
+		case "access_in_use", "busy":
+			code = http.StatusConflict // in_use: фронт переспросит и повторит с force=1
+		}
+		c.JSON(code, gin.H{"error": de})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// GET /api/v1/activity?year=2026[&team_id=] returns the activity grid for a calendar year.
+func (h *Handler) Activity(c *gin.Context) {
+	year := 0
+	if v := c.Query("year"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			year = n
+		}
+	}
+	c.JSON(http.StatusOK, h.svc.Activity(c.Request.Context(), c.GetString("user_id"), c.Query("team_id"), year))
+}
+
+// GET /api/v1/activity/day?date=YYYY-MM-DD[&team_id=] returns what happened that day (a square click).
+func (h *Handler) ActivityDay(c *gin.Context) {
+	events := h.svc.ActivityDayEvents(c.Request.Context(), c.GetString("user_id"), c.Query("team_id"), c.Query("date"))
+	c.JSON(http.StatusOK, gin.H{"events": events})
+}
+
+// GET /api/v1/usage lists used projects: personal (against your plan) and team (against the team plan).
+func (h *Handler) Usage(c *gin.Context) {
+	c.JSON(http.StatusOK, h.svc.Usage(c.Request.Context(), c.GetString("user_id")))
+}
+
+// GET /api/v1/servers lists where the user can deploy right now (access is already granted).
+func (h *Handler) Servers(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"servers": h.svc.Servers(c.Request.Context(), c.GetString("user_id"), c.Query("team_id"))})
+}
+
+// GET /api/v1/server-access lists every granted access: where our key sits and how to take it off.
+func (h *Handler) ListAccess(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"keys": h.svc.ListAccess(c.Request.Context(), c.GetString("user_id"))})
+}
+
+// PUT /api/v1/deploy/:id/env rewrites the .env of a running project and restarts its containers.
 func (h *Handler) UpdateEnv(c *gin.Context) {
 	userID := c.GetString("user_id")
 	var body struct {
@@ -298,6 +454,8 @@ func (h *Handler) UpdateEnv(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return
@@ -316,6 +474,8 @@ func (h *Handler) VPNConfig(c *gin.Context) {
 			code = http.StatusForbidden
 		case "not_found":
 			code = http.StatusNotFound
+		case "busy":
+			code = http.StatusConflict
 		}
 		c.JSON(code, gin.H{"error": de})
 		return

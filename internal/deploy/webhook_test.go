@@ -46,7 +46,7 @@ func TestWebhookScenarios(t *testing.T) {
 		body   string
 		expect int
 	}{
-		{"ping answers 200", "ping", "", "", http.StatusOK},
+		{"ping → 200", "ping", "", "", http.StatusOK},
 		{"not a push, ignored", "star", sign(secret, "{}"), "{}", http.StatusOK},
 		{"push with a bad signature, 401", "push", "sha256=deadbeef", pushDefault, http.StatusUnauthorized},
 		{"push to a non-default branch, skipped", "push", sign(secret, pushFeature), pushFeature, http.StatusOK},

@@ -1,7 +1,6 @@
 // Package gitlab is a thin client for GitLab OAuth and API v4.
-// The BaseURL is a parameter (gitlab.com by default), which leaves room for self-hosted instances.
-// The scopes are read only: read_user for login, read_api and read_repository for projects and
-// cloning.
+// BaseURL is a parameter (gitlab.com by default), groundwork for self-hosted instances.
+// Read-only scopes: read_user (the login), read_api and read_repository (projects and cloning).
 package gitlab
 
 import (
@@ -15,27 +14,27 @@ import (
 	"time"
 )
 
-// Scopes are what we ask for during authorization. The write scope (api) is deliberately left
-// out: the user adds the CD webhook by hand, and in exchange we never hold a token that can write.
+// Scopes are what we request during authorization. The write scope (api) is deliberately left out:
+// the user adds the CD webhook themselves, and in exchange we never hold a token that can write.
 const Scopes = "read_user read_api read_repository"
 
-// httpc has a hard timeout so a call never hangs until nginx gives up (same as githubHTTP in auth).
+// httpc has a hard timeout so we never hang until the nginx timeout (like githubHTTP in auth).
 var httpc = &http.Client{Timeout: 12 * time.Second}
 
-// Token is what we store for a user, encrypted: the access token lives two hours and the refresh
-// token rotates on every renewal.
+// Token is what we store for the user (encrypted): the access token lives 2 hours,
+// the refresh token rotates on every refresh.
 type Token struct {
 	Access    string    `json:"access"`
 	Refresh   string    `json:"refresh"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// Expired reports whether the access token is due for renewal, with a minute of slack.
+// Expired reports whether the access token is due for a refresh (with a minute to spare).
 func (t Token) Expired() bool {
 	return time.Now().After(t.ExpiresAt.Add(-1 * time.Minute))
 }
 
-// AuthURL is where the browser goes to ask the user for consent.
+// AuthURL is where the browser is redirected for consent.
 func AuthURL(baseURL, clientID, redirectURI, state string) string {
 	p := url.Values{}
 	p.Add("client_id", clientID)
@@ -46,7 +45,7 @@ func AuthURL(baseURL, clientID, redirectURI, state string) string {
 	return strings.TrimRight(baseURL, "/") + "/oauth/authorize?" + p.Encode()
 }
 
-// ExchangeCode trades an authorization code for a token pair.
+// ExchangeCode swaps an authorization code for a token pair.
 func ExchangeCode(ctx context.Context, baseURL, clientID, clientSecret, redirectURI, code string) (Token, error) {
 	form := url.Values{}
 	form.Add("grant_type", "authorization_code")
@@ -55,8 +54,8 @@ func ExchangeCode(ctx context.Context, baseURL, clientID, clientSecret, redirect
 	return tokenRequest(ctx, baseURL, clientID, clientSecret, form)
 }
 
-// RefreshToken gets a fresh pair from a refresh token. IMPORTANT: the refresh token rotates, so
-// the returned Token has to replace the old one in storage.
+// RefreshToken returns a fresh pair from a refresh token. IMPORTANT: the refresh rotates,
+// so the returned Token must be stored in place of the old one.
 func RefreshToken(ctx context.Context, baseURL, clientID, clientSecret, refresh string) (Token, error) {
 	form := url.Values{}
 	form.Add("grant_type", "refresh_token")
@@ -94,14 +93,14 @@ func tokenRequest(ctx context.Context, baseURL, clientID, clientSecret string, f
 	if tr.AccessToken == "" {
 		return Token{}, fmt.Errorf("gitlab token: пустой access_token")
 	}
-	exp := time.Now().Add(2 * time.Hour) // the GitLab default, used when expires_in is missing
+	exp := time.Now().Add(2 * time.Hour) // дефолт GitLab, если expires_in не пришёл
 	if tr.ExpiresIn > 0 {
 		exp = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
 	}
 	return Token{Access: tr.AccessToken, Refresh: tr.RefreshToken, ExpiresAt: exp}, nil
 }
 
-// User is the profile used for login and for linking an account.
+// User is the profile used for signing in and linking.
 type User struct {
 	ID        int64  `json:"id"`
 	Username  string `json:"username"`
@@ -119,9 +118,9 @@ func FetchUser(ctx context.Context, baseURL, access string) (User, error) {
 	return u, nil
 }
 
-// Project is shaped the way the frontend expects, the same as a github repository.
-// path_with_namespace plays the role of full_name. GitLab does not return the language in one
-// call, so that field is left out.
+// Project is shaped the way the frontend expects (the same shape as a GitHub repo).
+// path_with_namespace plays the role of full_name; GitLab does not return the language
+// in one call, so we leave the field out.
 type Project struct {
 	ID            int64  `json:"id"`
 	Name          string `json:"name"`
@@ -146,7 +145,7 @@ func FetchProjects(ctx context.Context, baseURL, access string) ([]Project, erro
 		DefaultBranch     string `json:"default_branch"`
 		LastActivityAt    string `json:"last_activity_at"`
 	}
-	// membership=true asks for the projects the user belongs to, personal and group alike
+	// membership=true: projects where the user is a member (personal and group ones)
 	path := "/api/v4/projects?membership=true&per_page=100&order_by=last_activity_at&sort=desc&simple=true"
 	if err := getJSON(ctx, baseURL, path, access, &raw); err != nil {
 		return nil, err
@@ -191,8 +190,7 @@ func getJSON(ctx context.Context, baseURL, path, access string, dst any) error {
 	return json.Unmarshal(body, dst)
 }
 
-// ErrUnauthorized means the access token expired or was revoked, so it is time to refresh or to
-// reconnect the account.
+// ErrUnauthorized means the access token expired or was revoked: refresh or reconnect.
 var ErrUnauthorized = fmt.Errorf("gitlab: unauthorized")
 
 func truncate(b []byte) string {

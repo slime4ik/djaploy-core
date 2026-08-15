@@ -18,7 +18,7 @@ import (
 type UserService struct {
 	repo     *UserRepo
 	cfg      *cfg.Config
-	oauthKey []byte // AES key for GitLab tokens in the database (a salt keeps it apart from deploy SSH keys)
+	oauthKey []byte // AES-ключ для GitLab-токенов в БД (соль отличает от SSH-ключей деплоя)
 }
 
 func NewUserService(repo *UserRepo, cfg *cfg.Config) *UserService {
@@ -32,7 +32,7 @@ func NewUserService(repo *UserRepo, cfg *cfg.Config) *UserService {
 func (s *UserService) CreateUser(ctx context.Context, github_id int64, username, avatar_url string) error {
 	user := NewUser(github_id, username, avatar_url)
 	if err := s.repo.CreateUser(ctx, user); err != nil {
-		return fmt.Errorf("create user: %w", err)
+		return fmt.Errorf("ошибка создания пользователя %w", err)
 	}
 	return nil
 }
@@ -45,13 +45,12 @@ func (s *UserService) GetUserProfile(ctx context.Context, userID string) (*User,
 	return user, nil
 }
 
-// IsActive reports whether a user is active, meaning not banned through the admin (is_active=false).
+// IsActive reports whether the user is active (not banned through the admin is_active=false).
 func (s *UserService) IsActive(ctx context.Context, userID string) (bool, error) {
 	return s.repo.IsActive(ctx, userID)
 }
 
-// LoginOrCreateUser returns the tokens, the userID and isNew (true when the user was just
-// created, which the promotion relies on).
+// Returns the tokens, the userID and isNew (true = the user was just created, for the promo).
 func (s *UserService) LoginOrCreateUser(ctx context.Context, githubUserID int64, username, avatarURL string) (access, refresh, userID string, isNew bool, err error) {
 	userID, err = s.repo.DoesUserExists(ctx, githubUserID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -68,7 +67,7 @@ func (s *UserService) LoginOrCreateUser(ctx context.Context, githubUserID int64,
 		userID = u.ID
 		isNew = true
 	}
-	// at this point userID exists, for an existing user and for a new one alike
+	// the userID is certainly there by now, for an old user and for a new one alike
 	access, refresh, err = s.GenerateTokens(userID)
 	if err != nil {
 		return "", "", "", false, fmt.Errorf("error creating tokens for %s: %w", userID, err)
@@ -76,8 +75,8 @@ func (s *UserService) LoginOrCreateUser(ctx context.Context, githubUserID int64,
 	return access, refresh, userID, isNew, nil
 }
 
-// LoginOrCreateUserGitLab signs a user in through GitLab: we look them up by gitlab_id or create
-// them. The GitLab tokens are stored encrypted, since the project list and the clone need them.
+// LoginOrCreateUserGitLab signs in through GitLab: find by gitlab_id or create.
+// GitLab tokens are stored encrypted (they are needed for the project list and for cloning).
 func (s *UserService) LoginOrCreateUserGitLab(ctx context.Context, glUser gitlab.User, tok gitlab.Token) (access, refresh, userID string, isNew bool, err error) {
 	tokenEnc, err := s.encryptGitLabToken(tok)
 	if err != nil {
@@ -105,7 +104,7 @@ func (s *UserService) LoginOrCreateUserGitLab(ctx context.Context, glUser gitlab
 	return access, refresh, userID, isNew, nil
 }
 
-// AttachGitLab attaches GitLab to the current profile, from the settings page.
+// AttachGitLab links GitLab to the current profile (from settings).
 func (s *UserService) AttachGitLab(ctx context.Context, userID string, glUser gitlab.User, tok gitlab.Token) error {
 	tokenEnc, err := s.encryptGitLabToken(tok)
 	if err != nil {
@@ -114,14 +113,13 @@ func (s *UserService) AttachGitLab(ctx context.Context, userID string, glUser gi
 	return s.repo.AttachGitLab(ctx, userID, glUser.ID, glUser.Username, tokenEnc)
 }
 
-// AttachGitHub attaches GitHub to a profile that was created through GitLab.
+// AttachGitHub links GitHub to a profile that was created through GitLab.
 func (s *UserService) AttachGitHub(ctx context.Context, userID string, githubID int64) error {
 	return s.repo.AttachGitHub(ctx, userID, githubID)
 }
 
-// GitLabToken returns a usable access token for the user: decrypt it and renew it when it has
-// expired (the refresh token rotates, so the new pair is saved). An error means GitLab is not
-// attached or access was revoked.
+// GitLabToken returns a live access token: decrypt it and refresh when it expired
+// (the refresh rotates, so we store the new pair). An error means GitLab is unlinked or revoked.
 func (s *UserService) GitLabToken(ctx context.Context, userID string) (string, error) {
 	enc, err := s.repo.GetGitLabTokenEnc(ctx, userID)
 	if err != nil {
@@ -170,7 +168,7 @@ func (s *UserService) AddInstallationID(ctx context.Context, GitHubID, installat
 	return nil
 }
 
-// AddInstallationIDByUser attaches an installation to the signed-in user, by the id from the JWT.
+// AddInstallationIDByUser links an installation to the signed-in user (id from the JWT).
 func (s *UserService) AddInstallationIDByUser(ctx context.Context, userID string, installationID int64) error {
 	return s.repo.AddInstallationIDByUser(ctx, userID, installationID)
 }
@@ -178,7 +176,7 @@ func (s *UserService) AddInstallationIDByUser(ctx context.Context, userID string
 func (s *UserService) GenerateTokens(userID string) (access, refresh string, err error) {
 	now := time.Now()
 
-	// ACCESS lives 15 minutes
+	// ACCESS: 15 minutes
 	accessClaims := AccessClaims{
 		UserID: userID,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -192,7 +190,7 @@ func (s *UserService) GenerateTokens(userID string) (access, refresh string, err
 		return "", "", err
 	}
 
-	// REFRESH lives 30 days and carries a unique jti
+	// REFRESH: 30 days, with a unique jti
 	refreshClaims := RefreshClaims{
 		UserID: userID,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -234,7 +232,7 @@ func (s *UserService) RefreshAccess(refreshToken string) (string, error) {
 	if err != nil || !token.Valid {
 		return "", fmt.Errorf("invalid refresh token: %w", err)
 	}
-	// a banned user cannot renew their access token, which is the second line after RequireActive
+	// a banned user cannot refresh the access token (the second line after RequireActive)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if active, aerr := s.repo.IsActive(ctx, claims.UserID); aerr == nil && !active {

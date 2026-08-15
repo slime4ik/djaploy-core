@@ -21,34 +21,38 @@ type Config struct {
 	GitHubAppWebHookSecret string
 	Port                   string
 
-	// URLs and cookies switch between dev and prod through env, with no code changes.
-	FrontendURL  string // where the browser goes after OAuth (the SPA)
-	PublicURL    string // the public address of the backend itself (for redirect_uri and callbacks)
-	CookieDomain string // cookie domain; empty means host-only, which is the recommended setting
-	CookieSecure bool   // true in production (https), false locally (http)
+	// URLs and cookies: switch dev↔prod through env, without touching code.
+	FrontendURL  string // куда редиректим браузер после OAuth (SPA)
+	PublicURL    string // публичный адрес самого бэка (для redirect_uri/callback)
+	CookieDomain string // домен куки; пусто = host-only (рекомендуется)
+	CookieSecure bool   // true в проде (https), false локально (http)
 
-	// Payment provider credentials for subscriptions. Optional: without them billing is off.
+	// YooKassa: subscription payments (optional, without them billing is off).
 	YooKassaShopID    string
 	YooKassaSecretKey string
 
-	// Secret token for the admin endpoints, used to grant subscriptions by hand. Empty disables them.
+	// Secret token for the admin endpoints (granting subscriptions by hand). Empty = admin off.
 	AdminToken string
 
-	// Secret code for the demo login, used by payment provider reviewers. Empty disables it.
+	// Secret demo login code (for YooKassa moderators). Empty = demo login off.
 	DemoCode string
 
-	// Telegram bot for notifications. Empty disables notifications.
+	// Telegram bot for notifications. Empty = notifications off.
 	TelegramBotToken    string
 	TelegramBotUsername string
 
-	// Promotion: a new user gets Max for N days on first sign-in, with no card, and drops to free
-	// afterwards. 0 disables it. Set through PROMO_NEW_USER_MAX_DAYS, no code changes needed.
+	// Promo: new users get Max for N days on first login (no card, then back to free).
+	// 0 = off. Changed through PROMO_NEW_USER_MAX_DAYS without touching code.
 	PromoNewUserMaxDays int
+	// How many days of Max we add for the FIRST successful deploy (0 = off).
+	// The welcome days start at signup, but before the first deploy there is still a server to buy:
+	// this bonus starts when the product actually began to be used.
+	PromoFirstDeployDays int
 
-	// GitLab OAuth. Optional: when empty the GitLab buttons are hidden and the endpoints answer 501.
+	// GitLab OAuth (optional: empty hides the GitLab buttons and the endpoints answer 501).
 	GitLabClientID     string
 	GitLabClientSecret string
-	GitLabBaseURL      string // https://gitlab.com, leaving room for self-hosted instances
+	GitLabBaseURL      string // https://gitlab.com; задел под self-hosted
 }
 
 // GitLabEnabled reports whether the GitLab provider is configured.
@@ -85,7 +89,8 @@ func Load() (*Config, error) {
 		TelegramBotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramBotUsername: os.Getenv("TELEGRAM_BOT_USERNAME"),
 
-		PromoNewUserMaxDays: atoiDefault(os.Getenv("PROMO_NEW_USER_MAX_DAYS"), 0),
+		PromoNewUserMaxDays:  atoiDefault(os.Getenv("PROMO_NEW_USER_MAX_DAYS"), 0),
+		PromoFirstDeployDays: atoiDefault(os.Getenv("PROMO_FIRST_DEPLOY_DAYS"), 7),
 
 		GitLabClientID:     os.Getenv("GITLAB_CLIENT_ID"),
 		GitLabClientSecret: os.Getenv("GITLAB_CLIENT_SECRET"),
@@ -128,7 +133,7 @@ func getenvDefault(key, def string) string {
 	return def
 }
 
-// atoiDefault parses an integer from a string, returning def when it is empty or invalid.
+// atoiDefault parses an int from a string, returning def when it is empty or invalid.
 func atoiDefault(s string, def int) int {
 	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
 		return n

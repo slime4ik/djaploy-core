@@ -43,9 +43,8 @@ func (r *Repo) countActiveDeploys(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// StartMaintenanceWatcher is a background loop: once maintenance is on and no deploys are
-// active, it pings the owner on Telegram once to say the release can go out. The ping flag resets
-// when maintenance is switched off.
+// StartMaintenanceWatcher is a background loop: as soon as maintenance mode is on and no deploys are
+// running, it pings the owner in Telegram once with "safe to roll". The ping resets when the mode goes off.
 func (s *Service) StartMaintenanceWatcher() {
 	go func() {
 		var pinged bool

@@ -9,11 +9,10 @@ import (
 	"time"
 )
 
-// Disk alert threshold and hysteresis, so we do not send "full" and "freed" on every percent
-// around the boundary.
+// Disk alert threshold and hysteresis (so we do not send "full/freed" on every percent near the edge).
 const (
-	diskAlertAt   = 90 // alert once usage reaches 90%
-	diskClearAt   = 85 // consider it cleared once usage drops below 85%
+	diskAlertAt   = 90 // алерт, когда занято ≥ 90%
+	diskClearAt   = 85 // «отпустило», когда опустилось ниже 85%
 	diskCheckTick = 15 * time.Minute
 )
 
@@ -78,6 +77,11 @@ func (s *Service) StartDiskMonitor() {
 // diskAlerted remembers whether the "disk is full" alert was already sent for a server.
 var diskAlerted sync.Map // server_ip -> bool
 
+// diskCheckWorkers is how many servers we poll at once. Going through them one by one was a
+// bottleneck: a single dead server holds the connection until the timeout (20s), and a couple of dozen
+// of those stretch the cycle to ten minutes. The limit keeps us from opening a hundred ssh sessions at once.
+const diskCheckWorkers = 8
+
 func (s *Service) checkDisks() {
 	if s.notifier == nil {
 		return
@@ -88,24 +92,38 @@ func (s *Service) checkDisks() {
 	if err != nil {
 		return
 	}
-	for _, m := range servers {
-		pct, ok := s.serverDiskPct(m)
-		if !ok {
-			continue
-		}
-		alerted, _ := diskAlerted.Load(m.serverIP)
-		wasAlerted, _ := alerted.(bool)
 
-		switch {
-		case pct >= diskAlertAt && !wasAlerted:
-			diskAlerted.Store(m.serverIP, true)
-			s.notifyServer(ctx, m, "⚠️ Диск сервера "+m.serverIP+" заполнен на "+strconv.Itoa(pct)+
-				"%. Почисти образы: docker system prune -a — или расширь диск. Иначе следующий деплой упадёт с «no space left».")
-		case pct < diskClearAt && wasAlerted:
-			diskAlerted.Store(m.serverIP, false)
-			s.notifyServer(ctx, m, "🟢 Диск сервера "+m.serverIP+" снова в норме ("+strconv.Itoa(pct)+"% занято).")
-		}
+	sem := make(chan struct{}, diskCheckWorkers)
+	var wg sync.WaitGroup
+	for _, m := range servers {
+		wg.Add(1)
+		go func(m serverMon) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			pct, ok := s.serverDiskPct(m)
+			if !ok {
+				return
+			}
+			alerted, _ := diskAlerted.Load(m.serverIP)
+			wasAlerted, _ := alerted.(bool)
+
+			// The notification goes out on its own context: the caller's could have expired while we waited on ssh.
+			nctx, ncancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer ncancel()
+			switch {
+			case pct >= diskAlertAt && !wasAlerted:
+				diskAlerted.Store(m.serverIP, true)
+				s.notifyServer(nctx, m, "⚠️ Диск сервера "+m.serverIP+" заполнен на "+strconv.Itoa(pct)+
+					"%. Почисти образы: docker system prune -a — или расширь диск. Иначе следующий деплой упадёт с «no space left».")
+			case pct < diskClearAt && wasAlerted:
+				diskAlerted.Store(m.serverIP, false)
+				s.notifyServer(nctx, m, "🟢 Диск сервера "+m.serverIP+" снова в норме ("+strconv.Itoa(pct)+"% занято).")
+			}
+		}(m)
 	}
+	wg.Wait()
 }
 
 // serverDiskPct returns how full the root partition is, in percent, over the stored key.
@@ -127,7 +145,7 @@ func (s *Service) serverDiskPct(m serverMon) (int, bool) {
 		return 0, false
 	}
 	if err != nil {
-		return 0, false // server unreachable, which the uptime monitor reports instead
+		return 0, false // сервер недоступен — не наша забота (аптайм-монитор это ловит)
 	}
 	defer sshc.Close()
 	var out string
@@ -149,7 +167,7 @@ var hostKeyAlerted sync.Map // server_ip -> bool
 // rather than "disk", because this is a security event and the disk toggle defaults to off.
 func (s *Service) alertHostKeyOnce(m serverMon, de *DeployError) {
 	if de.Code != "host_key_mismatch" {
-		return // an unknown server (no pin yet) is skipped quietly
+		return // незнакомый сервер (пин ещё не поставлен) — молча пропускаем
 	}
 	if _, seen := hostKeyAlerted.LoadOrStore(m.serverIP, true); seen {
 		return

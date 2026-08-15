@@ -1,6 +1,6 @@
-// Package crypto is AES-256-GCM encryption for the secrets we keep in the database, such as OAuth
-// tokens. It is the same scheme the deploy package uses for SSH keys, but with a different salt,
-// so the two key spaces never overlap.
+// Package crypto is AES-256-GCM encryption for secrets in the database (OAuth tokens and such).
+// The same proven scheme as the SSH keys in deploy, but with a different salt,
+// so the keys never overlap.
 package crypto
 
 import (
@@ -13,7 +13,7 @@ import (
 	"io"
 )
 
-// DeriveKey builds a 32 byte key from a secret and a salt, which keeps key domains separated.
+// DeriveKey builds a 32 byte key from a secret and a salt (domain separation of keys).
 func DeriveKey(secret, salt string) []byte {
 	h := sha256.Sum256([]byte(salt + ":" + secret))
 	return h[:]

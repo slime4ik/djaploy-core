@@ -11,8 +11,8 @@ import (
 
 func JWTMiddleware(jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. take the access token. The main source is the httpOnly cookie set by the OAuth
-		//    callback; Bearer and query are fallbacks for API clients and websockets.
+		// 1. take the access token. The main source is the httpOnly cookie (that is what callback sets).
+		//    Bearer and query are fallbacks (API clients, ws).
 		tokenString, err := c.Cookie("access_token")
 		if err != nil || tokenString == "" {
 			tokenString = strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -25,8 +25,7 @@ func JWTMiddleware(jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
-		// 2. parse and ALWAYS verify the signing method, otherwise alg:none and algorithm
-		//    swapping attacks work
+		// 2. parse and ALWAYS verify the signing method (otherwise alg:none / algorithm confusion)
 		claims := jwt.MapClaims{}
 		token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -39,7 +38,7 @@ func JWTMiddleware(jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
-		// 3. user_id (the tag in AccessClaims is "user_id")
+		// 3. user_id (the tag in AccessClaims is "user_id");
 		userID, _ := claims["user_id"].(string)
 		if userID == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "в токене нет user_id"})

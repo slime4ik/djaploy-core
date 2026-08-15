@@ -12,12 +12,12 @@ import (
 // would scare people on every single server for no reason.
 type ServerStats struct {
 	DiskUsedPct int             `json:"disk_used_pct"`
-	DiskUsed    string          `json:"disk_used"`  // for example "12.3 ГБ"
-	DiskTotal   string          `json:"disk_total"` // for example "40 ГБ"
+	DiskUsed    string          `json:"disk_used"`  // «12.3 ГБ»
+	DiskTotal   string          `json:"disk_total"` // «40 ГБ»
 	MemUsedPct  int             `json:"mem_used_pct"`
-	MemAvail    string          `json:"mem_avail"` // available memory, for example "1.4 ГБ"
+	MemAvail    string          `json:"mem_avail"` // «1.4 ГБ» доступно
 	MemTotal    string          `json:"mem_total"`
-	Load1       string          `json:"load1"` // one minute load average
+	Load1       string          `json:"load1"` // средняя загрузка за 1 мин
 	CPUs        int             `json:"cpus"`
 	Containers  []ContainerStat `json:"containers"`
 }
@@ -26,7 +26,7 @@ type ServerStats struct {
 type ContainerStat struct {
 	Name   string `json:"name"`
 	State  string `json:"state"`  // running | exited | restarting | ...
-	Status string `json:"status"` // "Up 3 hours" or "Exited (1) 2 minutes ago"
+	Status string `json:"status"` // «Up 3 hours» / «Exited (1) 2 minutes ago»
 }
 
 // ServerStats reads the server resources over the stored key. Access is granted to the owner or

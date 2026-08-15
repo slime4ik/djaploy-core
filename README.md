@@ -105,8 +105,8 @@ server are serialized with a per-IP lock, because they share one Caddy gateway.
 | Step | Where | What happens on your server |
 | --- | --- | --- |
 | DNS | `deployer.go` → `checkDNS` | Resolves your domain and compares it with the server IP. No SSH yet. Without a correct A record Let's Encrypt cannot issue a certificate, so this fails early and says so. |
-| Connect | `ssh.go` → `DialPassword`, `hostkey.go` | One SSH connection, password or keyboard-interactive. The server's host key is checked against the fingerprint we recorded on the first deploy, and a mismatch drops the connection before the password is sent. If the login is not root we check that `sudo` works and escalate only where needed (`deployer.go` → `priv`). |
-| Access key | `deployer.go` → `installAccessKey` | Generates an ed25519 key, appends the public half to `authorized_keys`, encrypts the private half and stores it. This is what makes later redeploys password free. |
+| Connect | `ssh.go` → `DialKey`/`DialPassword`, `hostkey.go` | One SSH connection. Normally on the key you granted yourself (see [Server access](#server-access)); a password is only the fallback for people the key did not work for. The server's host key is checked against the fingerprint recorded on the first connection, and a mismatch drops the connection before any credential is sent. If the login is not root we check that `sudo` works and escalate only where needed (`deployer.go` → `priv`). |
+| Access key | `access.go`, `deployer.go` → `keepAccessKey` | On the normal path there is nothing to install: you added our line yourself, so we just remember that key for later redeploys and exactly one line of ours stays in `authorized_keys`. On the password fallback `deployer.go` → `installAccessKey` generates an ed25519 key and appends the public half itself. |
 | Server prep | `deployer.go` → `prepareServer` | `apt-get update`, installs fail2ban (ban after 5 failed SSH attempts), opens 80 and 443 on the local firewall. |
 | Docker | `deployer.go` → `ensureDocker` | Installs Docker if it is missing, writes registry mirrors into `/etc/docker/daemon.json`, waits out any background apt that holds the lock. |
 | Clone | `deployer.go` → `clone` | Clones into `/opt/djaploy/<project>`. The token travels in `http.extraheader`, not in the URL and not in the deploy log (`deployer.go` → `gitAuth`). Requires a `docker-compose.yml` in the repo root. |
@@ -163,6 +163,25 @@ listed paths answer 404 for everyone except trusted IPs, where trusted means the
 `10.8.0.0/24` and any addresses you added. If there is nothing trusted, no guard is written at all,
 because locking a path for literally everyone including you is worse than leaving it open.
 
+## Server access
+
+We do not ask for your server password. `access.go` generates an ed25519 pair on our side and shows
+you one line plus the command that puts it into your own `~/.ssh/authorized_keys`. The public half
+goes to your server, the private half is encrypted and stored with us, so a copy of that line is
+useless to anyone who finds it: it is the lock, not the key.
+
+| What | Where | Detail |
+| --- | --- | --- |
+| Issue a key | `access.go` → `EnsureAccess` | One key per server plus ssh user, not per project. A second project on the same server reuses it, so only one line of ours ever sits in `authorized_keys`. We never reissue: the line you already added would quietly become junk. |
+| The line itself | `access.go` → `installOnServer`, `installCommand` | Ends with the comment `djaploy-xxxxxxxx`. That label is how you find it by eye, and what the revoke command matches on. |
+| Check | `access.go` → `CheckAccess` | We try the key and also look at what rights we get (root or passwordless sudo), so you learn about a problem here and not halfway through a deploy. |
+| Revoke | `access.go` → `RevokeAccess`, `revokeOnServer` | `sed -i "/djaploy-xxxxxxxx/d" ~/.ssh/authorized_keys`, from the dashboard or by hand. We also destroy our half of the key, and we verify the line is really gone instead of reporting success blindly. |
+| Which key connects | `access.go` → `accessKeyPEM` | Keys we know work come first. A granted but never-installed key used to shadow a working team key and break deploys, so the order is deliberate. |
+
+What the key can do on your server is whatever your ssh user can do, including `docker`, and docker
+is effectively root. That is what makes a deploy possible at all, and it is why the revoke is one
+line you control rather than a promise from us.
+
 ## What we change outside your project folder
 
 Your project lives in `/opt/djaploy/<project>`. Everything else we touch is listed here, so nothing
@@ -175,7 +194,7 @@ is a surprise. Optional rows only happen if you asked for that feature.
 | Docker itself | first deploy | Installed with the official script from `get.docker.com` if `docker` is missing. |
 | `/etc/docker/daemon.json` | every deploy | **Overwritten**, not merged: registry mirrors, `userland-proxy: false`, DNS 8.8.8.8 and 1.1.1.1. If you keep custom daemon settings there, back them up. |
 | `ufw` | every deploy | `allow 80/tcp` and `allow 443/tcp` if ufw is installed. Your cloud firewall is separate and we cannot touch it. |
-| `~/.ssh/authorized_keys` | first deploy | Our generated public key is appended. A full delete removes that line again. |
+| `~/.ssh/authorized_keys` | you add it, or the password fallback | Normally you paste our line yourself and can take it off with one command, the same one the dashboard shows. On the password fallback we append the line during the first deploy. A full delete removes it again. |
 | `/opt/djaploy/_gateway` | first web deploy | The shared Caddy stack: compose file, root Caddyfile, one snippet per site, Let's Encrypt data volume. |
 | docker network `djaploy` | first web deploy | Created, and your app container is attached to it by alias. Your own compose networks are untouched. |
 | `/etc/amnezia/amneziawg`, `/etc/sysctl.d/99-djaploy-wg.conf`, iptables, `awg-quick@awg0` | VPN only | AmneziaWG from the Amnezia PPA as a DKMS module, kernel headers installed, `ip_forward` enabled, one UDP port opened, NAT and FORWARD rules added. We also normalize the PPA codename to `noble` when your release has no packages there. |
@@ -243,11 +262,11 @@ raise ourselves in a review, roughly worst first.
   connection has nothing to compare against. Someone already sitting in the middle at that exact
   moment would be recorded as the real server. Every connection after it is protected, and a
   mismatch drops the connection before your password is sent.
-- **The git token and the sudo password appear in a process argument on your own server.** The
-  token goes into a `git -c http.extraheader=...` argument and the sudo password into a
-  `printf ... | sudo -S` command line. They are not in our logs and not in the URL, but anyone who
-  can run `ps` on your server at that moment can read them. On a single-admin VPS that is nobody;
-  on a shared box it is a real leak.
+- **The git token appears in a process argument on your own server.** It goes into a
+  `git -c http.extraheader=...` argument. It is not in our logs and not in the URL, but anyone who
+  can run `ps` on your server at that moment can read it. On a single-admin VPS that is nobody;
+  on a shared box it is a real leak. The same used to be true of the sudo password: on the key path
+  there is no password at all (`sudo -n`), and it only applies to the password fallback.
 - **`/etc/docker/daemon.json` is overwritten rather than merged.** If you had custom daemon options,
   they are gone after a deploy.
 - **The non-root deploy user is in the docker group**, which on any Linux box is equivalent to root.
@@ -271,6 +290,7 @@ raise ourselves in a review, roughly worst first.
 ```
 internal/deploy/      the deploy engine
   deployer.go         the full deploy cycle and every step
+  access.go           granting, checking and revoking server access
   redeploy.go         update and rollback
   gateway.go          the shared Caddy gateway lifecycle
   templates.go        Caddyfile, compose overlay, .env, monitoring configs
@@ -284,6 +304,7 @@ internal/deploy/      the deploy engine
   stats.go            disk, memory, containers on request
   diskmon.go          background disk alerts
   maintenance.go      maintenance mode and draining
+  activity.go         the activity feed: events, the day grid, one day's detail
 internal/auth/        sign-in, GitHub App, GitLab OAuth, sessions
 internal/crypto/      AES-256-GCM for stored secrets
 internal/github/      installation tokens

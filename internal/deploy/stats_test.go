@@ -20,7 +20,7 @@ func TestParseServerStats(t *testing.T) {
 		t.Fatalf("cpus/load: %d %q", st.CPUs, st.Load1)
 	}
 	// we report available memory, so used% = (total-avail)/total
-	if st.MemUsedPct != 31 { // (2048000-1400000)/2048000 is about 31%
+	if st.MemUsedPct != 31 { // (2048000-1400000)/2048000 ≈ 31%
 		t.Fatalf("mem used pct: expected about 31, got %d", st.MemUsedPct)
 	}
 	if st.MemAvail != "1.3 ГБ" {
